@@ -7,7 +7,7 @@
 [![MCP Registry](https://img.shields.io/badge/MCP%20Registry-io.github.StuMason%2Fcoolify-blue)](https://registry.modelcontextprotocol.io)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-Manage [Coolify](https://coolify.io/) from Claude, Cursor, or any MCP client: 46 tools for deploying, debugging, and operating your self-hosted PaaS in plain English. Destructive operations ask a human first; secrets stay masked.
+Manage [Coolify](https://coolify.io/) from Claude, Cursor, or any MCP client: 45 tools for deploying, debugging, and operating your self-hosted PaaS in plain English. Destructive operations ask a human first; secrets stay masked.
 
 📖 **[coolify-mcp.stumason.dev](https://coolify-mcp.stumason.dev)** · [Tool reference](docs/tools.md) · [Prompts and resources](docs/prompts-and-resources.md) · [Remote / HTTP mode](docs/http-mode.md) · [Fleet](docs/fleet.md) · [Doctor](docs/doctor.md) · [Safety and security](docs/security.md) · [Changelog](CHANGELOG.md)
 

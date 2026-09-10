@@ -2194,37 +2194,6 @@ describe('truncateLogs', () => {
 });
 
 describe('environments verify_app (#345)', () => {
-  it('preserves the legacy standalone tool proof without exposing the richer upstream identity', async () => {
-    const server = new CoolifyMcpServer({
-      baseUrl: 'http://localhost:3000',
-      accessToken: 'test-token',
-    });
-    const spy = jest.spyOn(server['client'], 'verifyApplicationEnvironment').mockResolvedValue({
-      verified: true,
-      application_uuid: 'app-exact-uuid',
-      environment: { id: 17, uuid: 'environment-exact-uuid', name: 'staging' },
-    });
-    const registered = (
-      server as unknown as {
-        _registeredTools: Record<
-          string,
-          { handler: (args: Record<string, unknown>, extra: unknown) => Promise<unknown> }
-        >;
-      }
-    )._registeredTools;
-    const result = (await registered['verify_app_environment'].handler(
-      {
-        application_uuid: 'app-exact-uuid',
-        project_uuid: 'project-exact-uuid',
-        expected_environment: 'staging',
-      },
-      {},
-    )) as { content: Array<{ text: string }> };
-    expect(spy).toHaveBeenCalledWith('app-exact-uuid', 'project-exact-uuid', 'staging');
-    expect(JSON.parse(result.content[0].text)).toEqual({ identity: '17', name: 'staging' });
-    spy.mockRestore();
-  });
-
   it('passes exact anchors to the client and returns the proof', async () => {
     const server = new CoolifyMcpServer({
       baseUrl: 'http://localhost:3000',
@@ -2340,7 +2309,6 @@ describe('tool annotations (#260)', () => {
         'server_domains',
         'server_resources',
         'teams',
-        'verify_app_environment',
       ].sort(),
     );
   });

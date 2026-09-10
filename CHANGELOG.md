@@ -9,7 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fork compatibility
 
-- Preserve `verify_app_environment` and its minimal `{ identity, name }` response as a compatibility wrapper over upstream `environments` / `verify_app`; retain strict exact-anchor validation before API requests.
+- Remove the fork-only `verify_app_environment` tool. Upstream landed the same capability in #381 as `environments { action: 'verify_app' }` (carrying commit `a886f064` from #345), and both registrations called the identical `CoolifyClient.verifyApplicationEnvironment`; the standalone tool differed only by projecting `{ identity, name }` instead of the full proof. Callers should use `environments { action: 'verify_app' }` and read `environment.id` / `environment.name`.
+- Retain the strict exact-anchor validation in `CoolifyClient.verifyApplicationEnvironment`, which upstream dropped. It rejects empty or whitespace-padded anchors and any containing `\0 \r \n / ? # % \` before a request is issued, and now guards the upstream `verify_app` action as the sole caller.
 
 ### Changed
 

@@ -107,10 +107,3 @@ otherwise odd-looking behaviour.
   was removed upstream in v4.1.0; use the `service` tool.
 
 The full list, with the upstream references, lives in [CLAUDE.md](../CLAUDE.md#coolify-api-gotchas).
-
-### Fork compatibility
-
-`verify_app_environment` retains the existing exact-anchor arguments and minimal
-`{ identity, name }` proof for current callers. New callers can use upstream
-`environments` with `action: "verify_app"` for the richer identity proof. Both
-paths use the same client verification and reject unsafe anchors before requests.

@@ -519,7 +519,6 @@ export const TOOL_ANNOTATIONS = {
   list_deployments: READ_ONLY,
   get_server: READ_ONLY,
   get_application: READ_ONLY,
-  verify_app_environment: READ_ONLY,
   get_database: READ_ONLY,
   get_service: READ_ONLY,
   server_resources: READ_ONLY,
@@ -1638,25 +1637,6 @@ export class CoolifyMcpServer extends McpServer {
           () => this.client.getApplication(uuid, { reveal }),
           (app) => getApplicationActions(app.uuid, app.status),
         ),
-    );
-
-    this.defineTool(
-      'verify_app_environment',
-      'Verify one exact application belongs to one exact project environment without list calls',
-      {
-        application_uuid: z.string().min(1),
-        project_uuid: z.string().min(1),
-        expected_environment: z.string().min(1),
-      },
-      async ({ application_uuid, project_uuid, expected_environment }) =>
-        wrap(async () => {
-          const proof = await this.client.verifyApplicationEnvironment(
-            application_uuid,
-            project_uuid,
-            expected_environment,
-          );
-          return { identity: String(proof.environment.id), name: proof.environment.name };
-        }),
     );
 
     this.defineTool(
