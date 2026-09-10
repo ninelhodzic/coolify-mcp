@@ -64,10 +64,29 @@ export interface Server {
   unreachable_count?: number;
   proxy_type?: 'traefik' | 'caddy' | 'none';
   proxy_status?: string;
+  // Only present on GET /servers/{uuid}, not on the list endpoint. Populated
+  // by Coolify's periodic proxy version check; null when up to date or when
+  // the proxy version has not been detected yet.
+  detected_traefik_version?: string | null;
+  traefik_outdated_info?: TraefikOutdatedInfo | null;
   settings?: ServerSettings;
   team_id?: number;
   created_at: string;
   updated_at: string;
+}
+
+/**
+ * Shape of `traefik_outdated_info` on GET /servers/{uuid} (verified live
+ * against Coolify v4.3.7). `type` is the semver distance of the available
+ * update, e.g. "patch_update".
+ */
+export interface TraefikOutdatedInfo {
+  current: string;
+  latest: string;
+  type?: string;
+  checked_at?: string;
+  newer_branch_target?: string;
+  newer_branch_latest?: string;
 }
 
 export interface ServerSettings {
@@ -109,6 +128,20 @@ export interface ServerResource {
 export interface ServerDomain {
   ip: string;
   domains: string[];
+}
+
+/** A Docker network destination attached to a server (GET /destinations). */
+export interface Destination {
+  uuid: string;
+  name: string;
+  network: string;
+  // The spec declares no `required` list for Destination. uuid/name/network
+  // are typed required anyway because a destination without them is unusable
+  // as a `destination_uuid` target; everything else may be absent at runtime.
+  type?: 'standalone' | 'swarm';
+  server_uuid?: string;
+  created_at?: string;
+  updated_at?: string;
 }
 
 export interface ServerValidation {
@@ -270,8 +303,9 @@ export interface Application {
  * need a project or environment enumeration to bind the two identities.
  */
 export interface ApplicationEnvironmentVerification {
-  identity: string;
-  name: string;
+  verified: true;
+  application_uuid: string;
+  environment: { id: number; uuid: string; name: string };
 }
 
 export interface CreateApplicationPublicRequest {
@@ -619,7 +653,8 @@ export interface UpdateDatabaseRequest {
   description?: string;
   image?: string;
   is_public?: boolean;
-  public_port?: number;
+  public_port?: number | null;
+  public_port_timeout?: number;
   limits_memory?: string;
   limits_memory_swap?: string;
   limits_memory_swappiness?: number;
@@ -850,14 +885,15 @@ export interface CreateServiceRequest {
   destination_uuid?: string;
   instant_deploy?: boolean;
   docker_compose_raw?: string; // Raw or base64 docker-compose YAML (auto-encoded by client)
+  is_container_label_escape_enabled?: boolean;
 }
 
 /**
  * CRITICAL: When updating services with Traefik basic auth labels
  *
- * 1. MANUAL STEP REQUIRED: You MUST disable "Escape characters in labels" in Coolify UI
- *    - Navigate to: Service Settings > Advanced > Container Label Character Escaping
- *    - This setting CANNOT be changed via API
+ * 1. You MUST disable "Escape characters in labels" on the service first:
+ *    pass `is_container_label_escape_enabled: false` on `service update`
+ *    (or Service Settings > Advanced > Container Label Character Escaping in the UI)
  *    - Without this, Coolify will double-escape $ signs, breaking htpasswd
  *
  * 2. Even with escaping disabled, Traefik still requires $$ in htpasswd hashes
@@ -876,6 +912,10 @@ export interface UpdateServiceRequest {
   name?: string;
   description?: string;
   docker_compose_raw?: string; // Raw or base64 docker-compose YAML (auto-encoded by client)
+  /** Attach the stack to the shared `coolify` network so other stacks can resolve its containers by name. */
+  connect_to_docker_network?: boolean;
+  instant_deploy?: boolean;
+  is_container_label_escape_enabled?: boolean;
 }
 
 /**
@@ -1190,7 +1230,19 @@ export interface ApplicationDiagnostic {
   logs: string | null;
   environment_variables: {
     count: number;
-    variables: Array<{ key: string; is_buildtime: boolean; is_runtime: boolean }>;
+    // Coolify auto-creates a preview twin for every production env var and the
+    // API returns both scopes merged, so `count` can legitimately be double the
+    // number of keys a user configured. `distinct_keys` and the per-scope
+    // counts make that readable without deduping the underlying rows (#336).
+    distinct_keys: number;
+    production_count: number;
+    preview_count: number;
+    variables: Array<{
+      key: string;
+      is_buildtime: boolean;
+      is_runtime: boolean;
+      is_preview: boolean;
+    }>;
   };
   recent_deployments: Array<{
     uuid: string;
@@ -1235,15 +1287,21 @@ export interface InfrastructureIssue {
   name: string;
   issue: string;
   status: string;
+  // 'critical' = down/unhealthy/unreachable; 'warning' = degraded signal worth
+  // surfacing (unknown health, available proxy update) that is not an outage.
+  severity: 'critical' | 'warning';
 }
 
 export interface InfrastructureIssuesReport {
   summary: {
     total_issues: number;
+    // The unhealthy_*/unreachable_* counts cover critical issues only, keeping
+    // their pre-#336 meaning; warnings are counted separately.
     unhealthy_applications: number;
     unhealthy_databases: number;
     unhealthy_services: number;
     unreachable_servers: number;
+    warnings: number;
   };
   issues: InfrastructureIssue[];
   errors?: string[];

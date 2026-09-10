@@ -7,10 +7,10 @@
  */
 import { createRequire } from 'module';
 import { describe, it, expect, beforeEach, afterEach, jest } from '@jest/globals';
-import { Client } from '@modelcontextprotocol/sdk/client/index.js';
-import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
+import { Client, InMemoryTransport } from '@modelcontextprotocol/client';
 import {
   CoolifyMcpServer,
+  FLEET_ONLY_TOOLS,
   TOOL_ANNOTATIONS,
   VERSION,
   truncateLogs,
@@ -64,6 +64,7 @@ describe('CoolifyMcpServer v2', () => {
       expect(typeof client.getServer).toBe('function');
       expect(typeof client.getServerResources).toBe('function');
       expect(typeof client.getServerDomains).toBe('function');
+      expect(typeof client.listDestinations).toBe('function');
       expect(typeof client.validateServer).toBe('function');
 
       // Project operations
@@ -273,6 +274,80 @@ describe('CoolifyMcpServer v2', () => {
       // CoolifyClient stores base URL without /api/v1 suffix
       expect(client['baseUrl']).toBe('http://localhost:3000');
       expect(client['accessToken']).toBe('test-token');
+    });
+  });
+
+  describe('environments tool handler', () => {
+    // The schema has always marked `name` optional on get; the handler used to
+    // reject anyway. It now defaults to the sole environment (#336).
+    const callEnvironments = async (
+      srv: CoolifyMcpServer,
+      args: Record<string, unknown>,
+    ): Promise<string> => {
+      const tool = (
+        srv as unknown as {
+          _registeredTools: Record<
+            string,
+            {
+              handler: (
+                args: Record<string, unknown>,
+                extra: unknown,
+              ) => Promise<{ content: Array<{ text: string }> }>;
+            }
+          >;
+        }
+      )._registeredTools['environments'];
+      const result = await tool.handler(args, {});
+      return result.content.map((c) => c.text).join('\n');
+    };
+
+    it('get with an explicit name skips the environment listing', async () => {
+      const list = jest.spyOn(server['client'], 'listProjectEnvironments');
+      const get = jest
+        .spyOn(server['client'], 'getProjectEnvironmentWithDatabases')
+        .mockResolvedValue({ id: 1, uuid: 'env-1', name: 'production' } as never);
+
+      await callEnvironments(server, { action: 'get', project_uuid: 'proj-1', name: 'production' });
+
+      expect(get).toHaveBeenCalledWith('proj-1', 'production');
+      expect(list).not.toHaveBeenCalled();
+    });
+
+    it('get without a name defaults to the sole environment', async () => {
+      jest
+        .spyOn(server['client'], 'listProjectEnvironments')
+        .mockResolvedValue([{ id: 1, uuid: 'env-1', name: 'production' }] as never);
+      const get = jest
+        .spyOn(server['client'], 'getProjectEnvironmentWithDatabases')
+        .mockResolvedValue({ id: 1, uuid: 'env-1', name: 'production' } as never);
+
+      const text = await callEnvironments(server, { action: 'get', project_uuid: 'proj-1' });
+
+      expect(get).toHaveBeenCalledWith('proj-1', 'production');
+      expect(text).toContain('production');
+    });
+
+    it('get without a name still requires one when several environments exist', async () => {
+      jest.spyOn(server['client'], 'listProjectEnvironments').mockResolvedValue([
+        { id: 1, uuid: 'env-1', name: 'production' },
+        { id: 2, uuid: 'env-2', name: 'staging' },
+      ] as never);
+      const get = jest.spyOn(server['client'], 'getProjectEnvironmentWithDatabases');
+
+      const text = await callEnvironments(server, { action: 'get', project_uuid: 'proj-1' });
+
+      expect(text).toContain(
+        'Error: name required — project has 2 environments: production, staging',
+      );
+      expect(get).not.toHaveBeenCalled();
+    });
+
+    it('get without a name reports an environment-less project instead of a bare rejection', async () => {
+      jest.spyOn(server['client'], 'listProjectEnvironments').mockResolvedValue([] as never);
+
+      const text = await callEnvironments(server, { action: 'get', project_uuid: 'proj-1' });
+
+      expect(text).toContain('Error: Project proj-1 has no environments');
     });
   });
 
@@ -538,13 +613,98 @@ describe('CoolifyMcpServer v2', () => {
       expect(vars[0].key).toBe('NODE_ENV');
     });
 
+    it('list with an application key + reveal requests full values and filters exactly', async () => {
+      const spy = jest.spyOn(server['client'], 'listApplicationEnvVars').mockResolvedValue([
+        {
+          uuid: 'env-1',
+          key: 'NODE_ENV',
+          value: 'plain-value',
+          real_value: 'plain-value',
+          is_buildtime: false,
+          is_runtime: true,
+          is_preview: false,
+        },
+        {
+          uuid: 'env-2',
+          key: 'UNSELECTED_VALUE',
+          value: 'do-not-return',
+          real_value: 'do-not-return',
+          is_buildtime: false,
+          is_runtime: true,
+          is_preview: false,
+        },
+      ] as never);
+
+      const result = (await callEnvVars(server, {
+        resource: 'application',
+        action: 'list',
+        uuid: 'app-uuid',
+        key: 'NODE_ENV',
+        reveal: true,
+      })) as { content: Array<{ text: string }> };
+
+      expect(spy).toHaveBeenCalledWith('app-uuid', { summary: false, reveal: true });
+      expect(result.content[0].text).not.toContain('do-not-return');
+      const vars = JSON.parse(result.content[0].text) as Array<{
+        key: string;
+        value: string;
+        real_value: string;
+      }>;
+      expect(vars).toHaveLength(1);
+      expect(vars[0]).toEqual(
+        expect.objectContaining({
+          key: 'NODE_ENV',
+          value: 'plain-value',
+          real_value: 'plain-value',
+        }),
+      );
+    });
+
+    it('reports when exact-key reveal is unavailable from the API', async () => {
+      const spy = jest.spyOn(server['client'], 'listApplicationEnvVars').mockResolvedValue([
+        {
+          uuid: 'env-1',
+          key: 'NODE_ENV',
+          value: undefined,
+          is_buildtime: false,
+          is_runtime: true,
+          is_preview: false,
+        },
+      ] as never);
+
+      const result = (await callEnvVars(server, {
+        resource: 'application',
+        action: 'list',
+        uuid: 'app-uuid',
+        key: 'NODE_ENV',
+        reveal: true,
+      })) as { content: Array<{ text: string }> };
+
+      expect(spy).toHaveBeenCalledWith('app-uuid', { summary: false, reveal: true });
+      expect(result.content[0].text).toContain('does not support sensitive env-var reads');
+    });
+
+    it('rejects reveal without an exact key before calling Coolify', async () => {
+      const spy = jest.spyOn(server['client'], 'listApplicationEnvVars');
+
+      const result = (await callEnvVars(server, {
+        resource: 'application',
+        action: 'list',
+        uuid: 'app-uuid',
+        reveal: true,
+      })) as { content: Array<{ text: string }> };
+
+      expect(spy).not.toHaveBeenCalled();
+      expect(result.content[0].text).toContain('requires an exact key');
+    });
+
     it('list with key + reveal exposes only the requested value', async () => {
       const spy = jest.spyOn(server['client'], 'listServiceEnvVars').mockResolvedValue([
         { uuid: 'env-1', key: 'FLAG', value: 'true', is_buildtime: false, is_runtime: true },
         {
           uuid: 'env-2',
           key: 'DB_PASSWORD',
-          value: 'hunter2',
+          value: 'not-selected',
           is_buildtime: false,
           is_runtime: true,
         },
@@ -559,7 +719,7 @@ describe('CoolifyMcpServer v2', () => {
       })) as { content: Array<{ text: string }> };
 
       expect(spy).toHaveBeenCalledWith('svc-uuid', { reveal: true });
-      expect(result.content[0].text).not.toContain('hunter2');
+      expect(result.content[0].text).not.toContain('not-selected');
       const vars = JSON.parse(result.content[0].text) as Array<{ key: string; value: string }>;
       expect(vars).toEqual([expect.objectContaining({ key: 'FLAG', value: 'true' })]);
     });
@@ -579,15 +739,16 @@ describe('CoolifyMcpServer v2', () => {
       expect(JSON.parse(result.content[0].text)).toHaveLength(2);
     });
 
-    it('database list forwards reveal to listDatabaseEnvVars (#276)', async () => {
+    it('database list forwards exact-key reveal to listDatabaseEnvVars (#276)', async () => {
       const spy = jest
         .spyOn(server['client'], 'listDatabaseEnvVars')
-        .mockResolvedValue([{ uuid: 'env-1', key: 'DB_PASSWORD', value: 'hunter2' }] as never);
+        .mockResolvedValue([{ uuid: 'env-1', key: 'DB_PASSWORD', value: 'plain-value' }] as never);
 
       await callEnvVars(server, {
         resource: 'database',
         action: 'list',
         uuid: 'db-uuid',
+        key: 'DB_PASSWORD',
         reveal: true,
       });
 
@@ -937,7 +1098,7 @@ describe('CoolifyMcpServer v2', () => {
           >;
         }
       )._registeredTools['database'];
-      return tool.handler(args, {});
+      return tool.handler(args, { mcpReq: { signal: new AbortController().signal } });
     };
 
     it('forwards destination_uuid to createPostgresql when provided', async () => {
@@ -958,6 +1119,252 @@ describe('CoolifyMcpServer v2', () => {
           destination_uuid: 'dest-uuid',
         }),
       );
+    });
+
+    it('update forwards is_public/public_port and strips create-only fields (#351)', async () => {
+      const spy = jest
+        .spyOn(server['client'], 'updateDatabase')
+        .mockResolvedValue({ uuid: 'db-1' } as any);
+
+      await callDatabase(server, {
+        action: 'update',
+        uuid: 'db-1',
+        is_public: true,
+        public_port: 5433,
+        server_uuid: 'server-uuid',
+        project_uuid: 'proj-uuid',
+        instant_deploy: true,
+      });
+
+      expect(spy).toHaveBeenCalledWith('db-1', { is_public: true, public_port: 5433 });
+    });
+
+    it('allows null public_port only on update through MCP validation', async () => {
+      const transportServer = new CoolifyMcpServer({
+        baseUrl: 'http://localhost:3000',
+        accessToken: 'test-token',
+      });
+      const updateSpy = jest
+        .spyOn(transportServer['client'], 'updateDatabase')
+        .mockResolvedValue({ uuid: 'db-1' } as any);
+      const createSpy = jest
+        .spyOn(transportServer['client'], 'createPostgresql')
+        .mockResolvedValue({ uuid: 'db-1' });
+      const client = new Client({ name: 'test', version: '0' });
+      const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+      await Promise.all([
+        transportServer.connect(serverTransport),
+        client.connect(clientTransport),
+      ]);
+
+      try {
+        await client.callTool({
+          name: 'database',
+          arguments: { action: 'update', uuid: 'db-1', public_port: null },
+        });
+
+        expect(updateSpy).toHaveBeenCalledWith('db-1', { public_port: null });
+        const result = (await client.callTool({
+          name: 'database',
+          arguments: {
+            action: 'create',
+            type: 'postgresql',
+            server_uuid: 'server-1',
+            project_uuid: 'project-1',
+            public_port: null,
+          },
+        })) as { content: Array<{ text: string }> };
+
+        expect(result.content[0]?.text).toContain('public_port cannot be null on create');
+        expect(createSpy).not.toHaveBeenCalled();
+      } finally {
+        await client.close();
+      }
+    });
+
+    it('update passes credentials and limits through untouched (#351)', async () => {
+      const spy = jest
+        .spyOn(server['client'], 'updateDatabase')
+        .mockResolvedValue({ uuid: 'db-1' } as any);
+
+      await callDatabase(server, {
+        action: 'update',
+        uuid: 'db-1',
+        postgres_password: 'new-secret',
+        limits_memory: '512m',
+        public_port_timeout: 30,
+      });
+
+      expect(spy).toHaveBeenCalledWith('db-1', {
+        postgres_password: 'new-secret',
+        limits_memory: '512m',
+        public_port_timeout: 30,
+      });
+    });
+
+    it('update with is_public=true is refused when a human cannot be asked (#351)', async () => {
+      const strict = new CoolifyMcpServer(
+        { baseUrl: 'http://localhost:3000', accessToken: 'test-token' },
+        { requireElicitation: true },
+      );
+      const spy = jest
+        .spyOn(strict['client'], 'updateDatabase')
+        .mockResolvedValue({ uuid: 'db-1' } as any);
+
+      const result = (await callDatabase(strict, {
+        action: 'update',
+        uuid: 'db-1',
+        is_public: true,
+        public_port: 5433,
+      })) as { content: Array<{ text: string }> };
+
+      expect(spy).not.toHaveBeenCalled();
+      expect(result.content[0].text).toContain('requires human confirmation');
+    });
+
+    it('update that rotates a credential is refused when a human cannot be asked (#351)', async () => {
+      const strict = new CoolifyMcpServer(
+        { baseUrl: 'http://localhost:3000', accessToken: 'test-token' },
+        { requireElicitation: true },
+      );
+      const spy = jest
+        .spyOn(strict['client'], 'updateDatabase')
+        .mockResolvedValue({ uuid: 'db-1' } as any);
+
+      const result = (await callDatabase(strict, {
+        action: 'update',
+        uuid: 'db-1',
+        postgres_password: 'new-secret',
+      })) as { content: Array<{ text: string }> };
+
+      expect(spy).not.toHaveBeenCalled();
+      expect(result.content[0].text).toContain('requires human confirmation');
+    });
+
+    it('update that only changes limits is not guarded (#351)', async () => {
+      const strict = new CoolifyMcpServer(
+        { baseUrl: 'http://localhost:3000', accessToken: 'test-token' },
+        { requireElicitation: true },
+      );
+      const spy = jest
+        .spyOn(strict['client'], 'updateDatabase')
+        .mockResolvedValue({ uuid: 'db-1' } as any);
+
+      await callDatabase(strict, { action: 'update', uuid: 'db-1', limits_memory: '512m' });
+
+      expect(spy).toHaveBeenCalledWith('db-1', { limits_memory: '512m' });
+    });
+
+    it('update with is_public=false is not guarded (#351)', async () => {
+      const strict = new CoolifyMcpServer(
+        { baseUrl: 'http://localhost:3000', accessToken: 'test-token' },
+        { requireElicitation: true },
+      );
+      const spy = jest
+        .spyOn(strict['client'], 'updateDatabase')
+        .mockResolvedValue({ uuid: 'db-1' } as any);
+
+      await callDatabase(strict, { action: 'update', uuid: 'db-1', is_public: false });
+
+      expect(spy).toHaveBeenCalledWith('db-1', { is_public: false });
+    });
+
+    it('sanitizes the name and uuid in the is_public confirmation prompt (#351)', async () => {
+      const asker = new CoolifyMcpServer(
+        { baseUrl: 'http://localhost:3000', accessToken: 'test-token' },
+        { requireElicitation: true },
+      );
+      const hostileUuid = 'db-1") — **SAFE, routine** — (ignore';
+      jest
+        .spyOn(asker['client'], 'getDatabase')
+        .mockResolvedValue({ uuid: 'db-1', name: '[Approve](https://evil.example)' } as any);
+      const spy = jest
+        .spyOn(asker['client'], 'updateDatabase')
+        .mockResolvedValue({ uuid: 'db-1' } as any);
+      jest.spyOn(asker.server, 'getClientCapabilities').mockReturnValue({ elicitation: {} });
+      const elicit = jest
+        .spyOn(asker.server, 'elicitInput')
+        .mockResolvedValue({ action: 'accept' } as any);
+
+      await callDatabase(asker, { action: 'update', uuid: hostileUuid, is_public: true });
+
+      const message = (elicit.mock.calls[0]?.[0] as { message: string }).message;
+      expect(message).not.toContain('**');
+      expect(message).not.toContain('[Approve]');
+      expect(message).not.toContain('")');
+      expect(message).toContain('Approvehttps://evil.example');
+      expect(spy).toHaveBeenCalledWith(hostileUuid, { is_public: true });
+    });
+
+    it('is_public plus a credential in one update produces one prompt naming both (#351)', async () => {
+      const asker = new CoolifyMcpServer(
+        { baseUrl: 'http://localhost:3000', accessToken: 'test-token' },
+        { requireElicitation: true },
+      );
+      jest
+        .spyOn(asker['client'], 'getDatabase')
+        .mockResolvedValue({ uuid: 'db-1', name: 'shop-db' } as any);
+      const spy = jest
+        .spyOn(asker['client'], 'updateDatabase')
+        .mockResolvedValue({ uuid: 'db-1' } as any);
+      jest.spyOn(asker.server, 'getClientCapabilities').mockReturnValue({ elicitation: {} });
+      const elicit = jest
+        .spyOn(asker.server, 'elicitInput')
+        .mockResolvedValue({ action: 'accept' } as any);
+
+      await callDatabase(asker, {
+        action: 'update',
+        uuid: 'db-1',
+        is_public: true,
+        postgres_password: 'newpw',
+      });
+
+      const message = (elicit.mock.calls[0]?.[0] as { message: string }).message;
+      expect(elicit).toHaveBeenCalledTimes(1);
+      expect(message).toContain('public port (assigned by Coolify)');
+      expect(message).toContain('rotate postgres_password');
+      expect(message).not.toContain('newpw');
+      expect(spy).toHaveBeenCalledWith('db-1', { is_public: true, postgres_password: 'newpw' });
+    });
+
+    it('update with nothing to change is refused before the request (#351)', async () => {
+      const spy = jest.spyOn(server['client'], 'updateDatabase');
+      const result = (await callDatabase(server, {
+        action: 'update',
+        uuid: 'db-1',
+        instant_deploy: true,
+      })) as { content: Array<{ text: string }> };
+      expect(result.content[0].text).toBe('Error: nothing to update');
+      expect(spy).not.toHaveBeenCalled();
+    });
+
+    it('create with is_public=true is guarded like update (#351)', async () => {
+      const strict = new CoolifyMcpServer(
+        { baseUrl: 'http://localhost:3000', accessToken: 'test-token' },
+        { requireElicitation: true },
+      );
+      const spy = jest
+        .spyOn(strict['client'], 'createPostgresql')
+        .mockResolvedValue({ uuid: 'db-3' });
+
+      const result = (await callDatabase(strict, {
+        action: 'create',
+        type: 'postgresql',
+        project_uuid: 'proj-uuid',
+        server_uuid: 'server-uuid',
+        is_public: true,
+        public_port: 5433,
+      })) as { content: Array<{ text: string }> };
+
+      expect(spy).not.toHaveBeenCalled();
+      expect(result.content[0].text).toContain('requires human confirmation');
+    });
+
+    it('update requires a uuid', async () => {
+      const result = (await callDatabase(server, { action: 'update', is_public: true })) as {
+        content: Array<{ text: string }>;
+      };
+      expect(result.content[0].text).toBe('Error: uuid required');
     });
 
     it('omits destination_uuid from createPostgresql when not provided', async () => {
@@ -1194,6 +1601,27 @@ describe('CoolifyMcpServer v2', () => {
       });
       expect(spy).toHaveBeenCalledWith('app-uuid', { includeLogs: false });
       expect(result.content[0].text).not.toContain('BEGIN UNTRUSTED LOG OUTPUT');
+    });
+
+    it('passes list pagination to the Coolify client', async () => {
+      const server = new CoolifyMcpServer({ baseUrl: 'http://localhost:3000', accessToken: 't' });
+      const spy = jest.spyOn(server['client'], 'listApplicationDeployments').mockResolvedValue({
+        count: 25,
+        deployments: [],
+      });
+
+      await callDeploymentTool(server, {
+        action: 'list_for_app',
+        uuid: 'app-uuid',
+        page: 2,
+        per_page: 10,
+      });
+
+      expect(spy).toHaveBeenCalledWith('app-uuid', {
+        includeLogs: undefined,
+        page: 2,
+        perPage: 10,
+      });
     });
   });
 
@@ -1765,15 +2193,47 @@ describe('truncateLogs', () => {
   });
 });
 
-describe('verify_app_environment', () => {
-  it('passes exact anchors to the client and returns only the proof projection', async () => {
+describe('environments verify_app (#345)', () => {
+  it('preserves the legacy standalone tool proof without exposing the richer upstream identity', async () => {
+    const server = new CoolifyMcpServer({
+      baseUrl: 'http://localhost:3000',
+      accessToken: 'test-token',
+    });
+    const spy = jest.spyOn(server['client'], 'verifyApplicationEnvironment').mockResolvedValue({
+      verified: true,
+      application_uuid: 'app-exact-uuid',
+      environment: { id: 17, uuid: 'environment-exact-uuid', name: 'staging' },
+    });
+    const registered = (
+      server as unknown as {
+        _registeredTools: Record<
+          string,
+          { handler: (args: Record<string, unknown>, extra: unknown) => Promise<unknown> }
+        >;
+      }
+    )._registeredTools;
+    const result = (await registered['verify_app_environment'].handler(
+      {
+        application_uuid: 'app-exact-uuid',
+        project_uuid: 'project-exact-uuid',
+        expected_environment: 'staging',
+      },
+      {},
+    )) as { content: Array<{ text: string }> };
+    expect(spy).toHaveBeenCalledWith('app-exact-uuid', 'project-exact-uuid', 'staging');
+    expect(JSON.parse(result.content[0].text)).toEqual({ identity: '17', name: 'staging' });
+    spy.mockRestore();
+  });
+
+  it('passes exact anchors to the client and returns the proof', async () => {
     const server = new CoolifyMcpServer({
       baseUrl: 'http://localhost:3000',
       accessToken: 'test-token',
     });
     const proof = {
-      identity: '17',
-      name: 'staging',
+      verified: true as const,
+      application_uuid: 'app-exact-uuid',
+      environment: { id: 17, uuid: 'environment-exact-uuid', name: 'staging' },
     };
     const spy = jest
       .spyOn(server['client'], 'verifyApplicationEnvironment')
@@ -1787,17 +2247,24 @@ describe('verify_app_environment', () => {
       }
     )._registeredTools;
 
-    const result = (await registered['verify_app_environment'].handler(
+    const result = (await registered['environments'].handler(
       {
+        action: 'verify_app',
         application_uuid: 'app-exact-uuid',
         project_uuid: 'project-exact-uuid',
-        expected_environment: 'staging',
+        name: 'staging',
       },
       {},
     )) as { content: Array<{ text: string }> };
 
     expect(spy).toHaveBeenCalledWith('app-exact-uuid', 'project-exact-uuid', 'staging');
     expect(JSON.parse(result.content[0].text)).toEqual(proof);
+
+    const missing = (await registered['environments'].handler(
+      { action: 'verify_app', project_uuid: 'project-exact-uuid' },
+      {},
+    )) as { content: Array<{ text: string }> };
+    expect(missing.content[0].text).toContain('name and application_uuid required');
   });
 });
 
@@ -1827,8 +2294,13 @@ describe('tool annotations (#260)', () => {
 
   it('keeps the annotations table and the registered tools exactly in step', () => {
     // Either direction is a bug: a table entry with no tool is dead config, a
-    // tool with no entry cannot register at all (defineTool throws).
-    expect(Object.keys(TOOL_ANNOTATIONS).sort()).toEqual(Object.keys(registered).sort());
+    // tool with no entry cannot register at all (defineTool throws). Fleet-only
+    // tools are absent on a single-instance server by design (#367); the
+    // fleet suite checks the table against a fleet-mode server.
+    const expected = Object.keys(TOOL_ANNOTATIONS).filter(
+      (name) => !FLEET_ONLY_TOOLS.has(name as keyof typeof TOOL_ANNOTATIONS),
+    );
+    expect(expected.sort()).toEqual(Object.keys(registered).sort());
   });
 
   it('never marks a tool both read-only and destructive', () => {
@@ -1860,6 +2332,7 @@ describe('tool annotations (#260)', () => {
         'list_applications',
         'list_databases',
         'list_deployments',
+        'list_destinations',
         'list_servers',
         'list_services',
         'logs',
@@ -1946,7 +2419,7 @@ describe('tool annotations (#260)', () => {
     it('delivers annotations to the client, not just to the registry', async () => {
       const tools = await listTools();
 
-      expect(tools).toHaveLength(Object.keys(TOOL_ANNOTATIONS).length);
+      expect(tools).toHaveLength(Object.keys(TOOL_ANNOTATIONS).length - FLEET_ONLY_TOOLS.size);
       const unannotated = tools.filter((t) => !t.annotations).map((t) => t.name);
       expect(unannotated).toEqual([]);
 
@@ -2462,6 +2935,120 @@ describe('service sub-application actions (#322)', () => {
     return tool.handler(args, {});
   };
 
+  describe('create', () => {
+    it('forwards destination_uuid and environment_uuid to createService (#351)', async () => {
+      const spy = jest
+        .spyOn(server['client'], 'createService')
+        .mockResolvedValue({ uuid: 'svc-1' } as any);
+
+      await callService({
+        action: 'create',
+        type: 'plausible',
+        server_uuid: 'server-uuid',
+        project_uuid: 'proj-uuid',
+        environment_uuid: 'env-uuid',
+        destination_uuid: 'dest-uuid',
+      });
+
+      expect(spy).toHaveBeenCalledWith(
+        expect.objectContaining({ destination_uuid: 'dest-uuid', environment_uuid: 'env-uuid' }),
+      );
+    });
+
+    it('forwards is_container_label_escape_enabled on create (#351)', async () => {
+      const spy = jest
+        .spyOn(server['client'], 'createService')
+        .mockResolvedValue({ uuid: 'svc-1' } as any);
+
+      await callService({
+        action: 'create',
+        type: 'plausible',
+        server_uuid: 'server-uuid',
+        project_uuid: 'proj-uuid',
+        is_container_label_escape_enabled: false,
+      });
+
+      expect(spy).toHaveBeenCalledWith(
+        expect.objectContaining({ is_container_label_escape_enabled: false }),
+      );
+    });
+
+    it('omits destination_uuid from createService when not provided (#351)', async () => {
+      const spy = jest
+        .spyOn(server['client'], 'createService')
+        .mockResolvedValue({ uuid: 'svc-1' } as any);
+
+      await callService({
+        action: 'create',
+        type: 'plausible',
+        server_uuid: 'server-uuid',
+        project_uuid: 'proj-uuid',
+      });
+
+      const forwarded = spy.mock.calls[0]?.[0] as unknown as Record<string, unknown>;
+      expect(forwarded.destination_uuid).toBeUndefined();
+    });
+  });
+
+  describe('update', () => {
+    it('forwards connect_to_docker_network and nothing create-only (#351)', async () => {
+      const spy = jest
+        .spyOn(server['client'], 'updateService')
+        .mockResolvedValue({ uuid: 'svc-1' } as any);
+
+      await callService({
+        action: 'update',
+        uuid: 'svc-1',
+        connect_to_docker_network: true,
+        server_uuid: 'server-uuid',
+        destination_uuid: 'dest-uuid',
+      });
+
+      expect(spy).toHaveBeenCalledWith('svc-1', {
+        name: undefined,
+        description: undefined,
+        docker_compose_raw: undefined,
+        connect_to_docker_network: true,
+        instant_deploy: undefined,
+        is_container_label_escape_enabled: undefined,
+      });
+    });
+
+    it('update with nothing to change is refused before the request (#351)', async () => {
+      const spy = jest.spyOn(server['client'], 'updateService');
+      const result = (await callService({
+        action: 'update',
+        uuid: 'svc-1',
+        server_uuid: 'server-uuid',
+      })) as { content: Array<{ text: string }> };
+      expect(result.content[0].text).toBe('Error: nothing to update');
+      expect(spy).not.toHaveBeenCalled();
+    });
+
+    it('still forwards instant_deploy and is_container_label_escape_enabled', async () => {
+      const spy = jest
+        .spyOn(server['client'], 'updateService')
+        .mockResolvedValue({ uuid: 'svc-1' } as any);
+
+      await callService({
+        action: 'update',
+        uuid: 'svc-1',
+        docker_compose_raw: 'services: {}',
+        instant_deploy: true,
+        is_container_label_escape_enabled: false,
+      });
+
+      expect(spy).toHaveBeenCalledWith(
+        'svc-1',
+        expect.objectContaining({
+          docker_compose_raw: 'services: {}',
+          instant_deploy: true,
+          is_container_label_escape_enabled: false,
+        }),
+      );
+    });
+  });
+
   describe('update_application', () => {
     it('requires uuid and app_uuid', async () => {
       const result = (await callService({ action: 'update_application' })) as {
@@ -2712,5 +3299,44 @@ describe('getPagination', () => {
   it('should return undefined when count is undefined', () => {
     const result = getPagination('list_apps', 1, 50, undefined);
     expect(result).toBeUndefined();
+  });
+});
+
+describe('list_destinations (#351)', () => {
+  let server: CoolifyMcpServer;
+  beforeEach(() => {
+    server = new CoolifyMcpServer({
+      baseUrl: 'http://localhost:3000',
+      accessToken: 'test-token',
+    });
+  });
+
+  const call = async (
+    args: Record<string, unknown>,
+  ): Promise<{ content: Array<{ text: string }> }> => {
+    const tool = (
+      server as unknown as {
+        _registeredTools: Record<
+          string,
+          { handler: (a: unknown, b: unknown) => Promise<{ content: Array<{ text: string }> }> }
+        >;
+      }
+    )._registeredTools['list_destinations'];
+    return tool.handler(args, {});
+  };
+
+  it('scopes to a server when server_uuid is given', async () => {
+    const spy = jest
+      .spyOn(server['client'], 'listDestinations')
+      .mockResolvedValue([{ uuid: 'dest-1', name: 'coolify' }] as any);
+    const result = await call({ server_uuid: 'server-uuid' });
+    expect(spy).toHaveBeenCalledWith('server-uuid');
+    expect(result.content[0].text).toContain('dest-1');
+  });
+
+  it('lists team-wide when no server_uuid is given', async () => {
+    const spy = jest.spyOn(server['client'], 'listDestinations').mockResolvedValue([]);
+    await call({});
+    expect(spy).toHaveBeenCalledWith(undefined);
   });
 });

@@ -5,11 +5,9 @@
 
 import { createRequire } from 'module';
 import { randomBytes } from 'node:crypto';
-import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
-import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
-import type { ToolAnnotations } from '@modelcontextprotocol/sdk/types.js';
-import type { ToolCallback } from '@modelcontextprotocol/sdk/server/mcp.js';
-import type { ZodRawShapeCompat } from '@modelcontextprotocol/sdk/server/zod-compat.js';
+import { AsyncLocalStorage } from 'node:async_hooks';
+import { McpServer } from '@modelcontextprotocol/server';
+import type { Transport, ToolAnnotations, ToolCallback } from '@modelcontextprotocol/server';
 import { z } from 'zod';
 import {
   CoolifyClient,
@@ -33,9 +31,37 @@ import type {
   DeploymentEssential,
   DeployTriggerResponse,
   UpdateServiceApplicationRequest,
+  UpdateServiceRequest,
+  Database,
 } from '../types/coolify.js';
 import { DocsSearchEngine } from './docs-search.js';
 import { confirmDestructive, describeBlastRadius, sanitizeForPrompt } from './elicit.js';
+import { DEFAULT_INSTANCE_NAME, InstanceRegistry, type InstanceDefinition } from './instances.js';
+
+/**
+ * Database credential fields whose change on `update` is guarded — usernames
+ * as well as passwords, since consumers hold both. The line is drawn at
+ * credentials on purpose: `image`, `public_port` and `limits_*` also disrupt,
+ * but they are the ordinary reasons to call `update` and a dialog on every
+ * one of them would teach humans to click through.
+ */
+const DB_CREDENTIAL_FIELDS = [
+  'postgres_user',
+  'postgres_password',
+  'mysql_user',
+  'mysql_root_password',
+  'mysql_password',
+  'mariadb_user',
+  'mariadb_root_password',
+  'mariadb_password',
+  'mongo_initdb_root_username',
+  'mongo_initdb_root_password',
+  'redis_password',
+  'keydb_password',
+  'clickhouse_admin_user',
+  'clickhouse_admin_password',
+  'dragonfly_password',
+] as const;
 
 const _require = createRequire(import.meta.url);
 export const VERSION: string = _require('../../package.json').version;
@@ -463,6 +489,8 @@ export const TOOL_ANNOTATIONS = {
   get_version: READ_ONLY,
   // Local constant, no API call — the one tool that touches nothing external.
   get_mcp_version: { readOnlyHint: true, openWorldHint: false },
+  // Fleet mode only (#367): registered when more than one instance is configured.
+  list_instances: READ_ONLY,
   get_infrastructure_overview: READ_ONLY,
   list_servers: READ_ONLY,
   list_applications: READ_ONLY,
@@ -476,6 +504,7 @@ export const TOOL_ANNOTATIONS = {
   get_service: READ_ONLY,
   server_resources: READ_ONLY,
   server_domains: READ_ONLY,
+  list_destinations: READ_ONLY,
   diagnose_app: READ_ONLY,
   diagnose_server: READ_ONLY,
   find_issues: READ_ONLY,
@@ -529,9 +558,63 @@ export const TOOL_ANNOTATIONS = {
  */
 export type ToolName = keyof typeof TOOL_ANNOTATIONS;
 
+/** Tools that exist only when more than one instance is configured (#367). */
+export const FLEET_ONLY_TOOLS: ReadonlySet<ToolName> = new Set<ToolName>(['list_instances']);
+
+export interface CoolifyMcpServerOptions {
+  /**
+   * Register only tools annotated read-only (#303). The mutating tools do not
+   * exist on the instance at all, rather than existing and refusing.
+   */
+  readonly?: boolean;
+  /**
+   * Destructive operations refuse instead of falling back to parameter-only
+   * confirmation when the client cannot be asked via elicitation (#303).
+   * HTTP mode sets this; stdio keeps the progressive-enhancement default.
+   */
+  requireElicitation?: boolean;
+}
+
+/**
+ * The per-tool `instance` argument, present only in fleet mode. One word of
+ * description on purpose: 45 copies of it ride on every tools/list, and the
+ * semantics live once, in `list_instances`.
+ */
+const INSTANCE_ARG = z.string().optional().describe('Instance name');
+
 export class CoolifyMcpServer extends McpServer {
-  private readonly client: CoolifyClient;
+  private readonly registry: InstanceRegistry;
+  /**
+   * One CoolifyClient per instance is load-bearing, not a style choice (#367):
+   * the GET/POST legacy-fallback cache, the version cache and the sanitizer
+   * all live at client scope, and prod on 4.1.2 next to staging on 4.3 need
+   * different cached answers for the same endpoint.
+   */
+  private readonly clients = new Map<string, CoolifyClient>();
+  /**
+   * The instance a tool call is executing against, established per call in
+   * {@link defineTool}. Request-scoped context rather than a swapped field so
+   * concurrent calls against different instances cannot cross — AsyncLocalStorage
+   * follows the call through every await, promise and timer.
+   */
+  private readonly instanceContext = new AsyncLocalStorage<InstanceDefinition>();
+  private readonly serverOptions: CoolifyMcpServerOptions;
   private readonly docsSearch: DocsSearchEngine = new DocsSearchEngine();
+
+  /** The client for the instance the current tool call targets (default outside any call). */
+  private get client(): CoolifyClient {
+    return this.clientFor(this.currentInstance);
+  }
+
+  private get currentInstance(): InstanceDefinition {
+    return this.instanceContext.getStore() ?? this.registry.default;
+  }
+
+  private clientFor(instance: InstanceDefinition): CoolifyClient {
+    const client = this.clients.get(instance.name);
+    if (!client) throw new Error(`No client for instance "${instance.name}"`);
+    return client;
+  }
 
   /**
    * Register a tool, attaching its annotations from {@link TOOL_ANNOTATIONS}.
@@ -542,11 +625,11 @@ export class CoolifyMcpServer extends McpServer {
    * throwing when someone runs the server; the runtime throw remains as a
    * backstop for dynamic callers.
    */
-  private defineTool<Args extends ZodRawShapeCompat>(
+  private defineTool<Args extends z.ZodRawShape>(
     name: ToolName,
     description: string,
     inputSchema: Args,
-    cb: ToolCallback<Args>,
+    cb: ToolCallback<z.ZodObject<Args>>,
   ): void {
     const annotations = TOOL_ANNOTATIONS[name];
     if (!annotations) {
@@ -554,7 +637,52 @@ export class CoolifyMcpServer extends McpServer {
         `Tool "${name}" has no entry in TOOL_ANNOTATIONS. Add one — clients use these hints to decide whether a call needs confirmation.`,
       );
     }
-    this.registerTool(name, { description, inputSchema, annotations }, cb);
+    // Read-only mode (#303): anything not annotated read-only is simply never
+    // registered, so a remote observability surface cannot mutate even if a
+    // token leaks — the tools do not exist on this server instance.
+    if (this.serverOptions.readonly && (annotations as ToolAnnotations).readOnlyHint !== true) {
+      return;
+    }
+    // Call sites keep the raw-shape ergonomics; the z.object wrap happens here
+    // because SDK v2 deprecates the raw-shape registerTool overload and this
+    // is the one place all 45 registrations pass through.
+    //
+    // Fleet mode (#367) adds the optional `instance` argument here, once for
+    // every tool — and only when there is more than one instance to choose
+    // between, so single-instance configs pay nothing on tools/list.
+    // Fleet-only tools (list_instances) are about the fleet, not an instance
+    // of it: no `instance` argument, so a wrong name can never break the one
+    // tool whose job is to correct wrong names.
+    const takesInstance = this.registry.isFleet && !FLEET_ONLY_TOOLS.has(name);
+    const shape = takesInstance ? { ...inputSchema, instance: INSTANCE_ARG } : inputSchema;
+    const scoped: ToolCallback<z.ZodObject<Args>> = (args, extra) => {
+      if (!takesInstance) return cb(args, extra);
+      // `instance` is routing, not payload. Several handlers rest-spread their
+      // args straight into a Coolify request body (application update,
+      // database, github_apps, database_backups), and upstream 422s on
+      // unknown fields — so it is stripped here, once, before any handler
+      // sees it, rather than trusted to every future `...rest`.
+      const { instance: requested, ...forwarded } = args as { instance?: string };
+      let instance: InstanceDefinition;
+      try {
+        instance = this.registry.get(requested);
+      } catch (error) {
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: `Error: ${error instanceof Error ? error.message : String(error)}`,
+            },
+          ],
+        };
+      }
+      return this.instanceContext.run(instance, () => cb(forwarded as typeof args, extra));
+    };
+    this.registerTool(
+      name,
+      { description, inputSchema: z.object(shape), annotations },
+      scoped as unknown as ToolCallback<z.ZodObject<typeof shape>>,
+    );
   }
 
   /**
@@ -587,16 +715,36 @@ export class CoolifyMcpServer extends McpServer {
     summarize: () => string | null | Promise<string | null>,
     operation: () => Promise<T>,
   ): Promise<{ content: Array<{ type: 'text'; text: string }> }> {
-    const outcome = await confirmDestructive(this.server, label, summarize, signal);
+    // Fleet mode (#367): every confirmation names the instance. Cross-instance
+    // fat-fingering is the failure mode a second instance invents, and the
+    // prompt is where it gets caught — "Delete api-server on prod?".
+    const instance = this.currentInstance;
+    const scopedLabel = this.registry.isFleet ? `${label} on instance "${instance.name}"` : label;
+    const scopedSummarize = this.registry.isFleet
+      ? async (): Promise<string | null> => {
+          const summary = await summarize();
+          return summary === null ? null : `Instance: ${instance.name}\n${summary}`;
+        }
+      : summarize;
+    const outcome = await confirmDestructive(this.server, scopedLabel, scopedSummarize, signal, {
+      requireHuman: this.serverOptions.requireElicitation,
+    });
     if (!outcome.approved) {
       return { content: [{ type: 'text' as const, text: outcome.message }] };
     }
     return wrap(operation);
   }
 
-  constructor(config: CoolifyConfig) {
+  constructor(config: CoolifyConfig | InstanceRegistry, options?: CoolifyMcpServerOptions) {
     super({ name: 'coolify', version: VERSION });
-    this.client = new CoolifyClient(config);
+    this.registry =
+      config instanceof InstanceRegistry
+        ? config
+        : new InstanceRegistry([{ name: DEFAULT_INSTANCE_NAME, ...config }]);
+    for (const instance of this.registry.all) {
+      this.clients.set(instance.name, new CoolifyClient(instance));
+    }
+    this.serverOptions = options ?? {};
     this.registerTools();
   }
 
@@ -714,6 +862,34 @@ export class CoolifyMcpServer extends McpServer {
         },
       ],
     }));
+
+    // Fleet mode only (#367). This is where the `instance` argument's
+    // semantics are documented, once, rather than 45 times.
+    if (this.registry.isFleet) {
+      this.defineTool(
+        'list_instances',
+        "The configured Coolify instances. Every tool takes an optional `instance` (one of these names); omitted means the default. Reports each instance's live Coolify version, or the error reaching it. Tokens are never shown.",
+        {},
+        async () =>
+          wrap(async () =>
+            Promise.all(
+              this.registry.all.map(async (instance) => {
+                const base = {
+                  name: instance.name,
+                  url: instance.baseUrl,
+                  default: instance.name === this.registry.default.name,
+                };
+                try {
+                  const { version } = await this.clientFor(instance).getVersion();
+                  return { ...base, version };
+                } catch (error) {
+                  return { ...base, error: error instanceof Error ? error.message : String(error) };
+                }
+              }),
+            ),
+          ),
+      );
+    }
 
     // =========================================================================
     // Infrastructure Overview (1 tool)
@@ -842,6 +1018,18 @@ export class CoolifyMcpServer extends McpServer {
     );
 
     this.defineTool(
+      'list_destinations',
+      'List Docker network destinations (Coolify v4.2+). A server with more than one destination requires `destination_uuid` on application/database/service create; this is where to find it.',
+      {
+        server_uuid: z
+          .string()
+          .optional()
+          .describe('Limit to one server. Omit for every destination the team can see.'),
+      },
+      async ({ server_uuid }) => wrap(() => this.client.listDestinations(server_uuid)),
+    );
+
+    this.defineTool(
       'validate_server',
       'Validate server connection',
       { uuid: z.string() },
@@ -882,7 +1070,7 @@ export class CoolifyMcpServer extends McpServer {
             if (!uuid)
               return { content: [{ type: 'text' as const, text: 'Error: uuid required' }] };
             return this.guardDestructive(
-              extra.signal,
+              extra.mcpReq.signal,
               `Delete a Coolify project and everything in it.`,
               // The label says "and everything in it" but the message is what
               // the human actually reads, so it has to carry the same weight.
@@ -931,22 +1119,48 @@ export class CoolifyMcpServer extends McpServer {
     // =========================================================================
     this.defineTool(
       'environments',
-      'Manage environments: list/get/create/delete (get includes dragonfly/keydb/clickhouse DBs missing from API)',
+      'Manage environments: list/get/create/delete/verify_app (get includes dragonfly/keydb/clickhouse DBs missing from API; when the project has exactly one environment, get may omit name; verify_app proves application_uuid is bound to environment `name` of project_uuid using only exact endpoints, a pre-mutation guard)',
       {
-        action: z.enum(['list', 'get', 'create', 'delete']),
+        action: z.enum(['list', 'get', 'create', 'delete', 'verify_app']),
         project_uuid: z.string(),
         name: z.string().optional(),
         description: z.string().optional(),
+        application_uuid: z.string().optional(),
       },
-      async ({ action, project_uuid, name, description }, extra) => {
+      async ({ action, project_uuid, name, description, application_uuid }, extra) => {
         switch (action) {
           case 'list':
             return wrap(() => this.client.listProjectEnvironments(project_uuid));
+          case 'verify_app':
+            if (!name || !application_uuid)
+              return {
+                content: [
+                  { type: 'text' as const, text: 'Error: name and application_uuid required' },
+                ],
+              };
+            return wrap(() =>
+              this.client.verifyApplicationEnvironment(application_uuid, project_uuid, name),
+            );
           case 'get':
-            if (!name)
-              return { content: [{ type: 'text' as const, text: 'Error: name required' }] };
-            // Use enhanced method that includes missing DB types (#88)
-            return wrap(() => this.client.getProjectEnvironmentWithDatabases(project_uuid, name));
+            // The schema has always marked name optional here, but the handler
+            // rejected without it (#336). Default to the sole environment when
+            // the project has exactly one; anything else still needs a name.
+            return wrap(async () => {
+              let envName = name;
+              if (!envName) {
+                const envs = await this.client.listProjectEnvironments(project_uuid);
+                if (envs.length !== 1) {
+                  throw new Error(
+                    envs.length === 0
+                      ? `Project ${project_uuid} has no environments`
+                      : `name required — project has ${envs.length} environments: ${envs.map((e) => e.name).join(', ')}`,
+                  );
+                }
+                envName = envs[0].name;
+              }
+              // Use enhanced method that includes missing DB types (#88)
+              return this.client.getProjectEnvironmentWithDatabases(project_uuid, envName);
+            });
           case 'create':
             if (!name)
               return { content: [{ type: 'text' as const, text: 'Error: name required' }] };
@@ -957,7 +1171,7 @@ export class CoolifyMcpServer extends McpServer {
             if (!name)
               return { content: [{ type: 'text' as const, text: 'Error: name required' }] };
             return this.guardDestructive(
-              extra.signal,
+              extra.mcpReq.signal,
               `Delete an environment from a Coolify project.`,
               // Says that Coolify refuses a non-empty environment (documented
               // 400, `Environment has resources, so it cannot be deleted.`)
@@ -1012,13 +1226,14 @@ export class CoolifyMcpServer extends McpServer {
         expected_environment: z.string().min(1),
       },
       async ({ application_uuid, project_uuid, expected_environment }) =>
-        wrap(() =>
-          this.client.verifyApplicationEnvironment(
+        wrap(async () => {
+          const proof = await this.client.verifyApplicationEnvironment(
             application_uuid,
             project_uuid,
             expected_environment,
-          ),
-        ),
+          );
+          return { identity: String(proof.environment.id), name: proof.environment.name };
+        }),
     );
 
     this.defineTool(
@@ -1041,7 +1256,12 @@ export class CoolifyMcpServer extends McpServer {
         server_uuid: z.string().optional(),
         github_app_uuid: z.string().optional(),
         private_key_uuid: z.string().optional(),
-        destination_uuid: z.string().optional(),
+        destination_uuid: z
+          .string()
+          .optional()
+          .describe(
+            'Required if the server has multiple destinations; find it with `list_destinations`.',
+          ),
         git_repository: z.string().optional(),
         git_branch: z.string().optional(),
         environment_name: z.string().optional(),
@@ -1363,7 +1583,7 @@ export class CoolifyMcpServer extends McpServer {
             if (!uuid)
               return { content: [{ type: 'text' as const, text: 'Error: uuid required' }] };
             return this.guardDestructive(
-              extra.signal,
+              extra.mcpReq.signal,
               `Delete an application, and by default its persistent volumes.`,
               async () => {
                 const app = await this.client.getApplication(uuid);
@@ -1456,9 +1676,9 @@ export class CoolifyMcpServer extends McpServer {
 
     this.defineTool(
       'database',
-      'Manage database: create/delete',
+      'Manage database: create/update/delete. `update` is how you expose an existing database on a public port (`is_public` + `public_port`) or change limits/credentials. Credential fields must match the engine (postgres_* on postgresql, and so on); changing any *_user/*_password on update asks for confirmation, since every app holding the old value breaks.',
       {
-        action: z.enum(['create', 'delete']),
+        action: z.enum(['create', 'update', 'delete']),
         type: z
           .enum([
             'postgresql',
@@ -1478,12 +1698,34 @@ export class CoolifyMcpServer extends McpServer {
         destination_uuid: z
           .string()
           .optional()
-          .describe('Destination UUID. Required if server has multiple destinations.'),
+          .describe(
+            'Destination UUID. Required if the server has multiple destinations; find it with `list_destinations`.',
+          ),
         name: z.string().optional(),
         description: z.string().optional(),
         image: z.string().optional(),
-        is_public: z.boolean().optional(),
-        public_port: z.number().optional(),
+        is_public: z
+          .boolean()
+          .optional()
+          .describe(
+            'Expose on a public port. `true` asks for confirmation first, on create and update.',
+          ),
+        public_port: z
+          .number()
+          .nullable()
+          .optional()
+          .describe('Public port. On update, null clears the assigned port.'),
+        public_port_timeout: z.number().optional().describe('Update only'),
+        limits_memory: z
+          .string()
+          .optional()
+          .describe('Update only, e.g. "512m". limits_* take effect after a `control` restart.'),
+        limits_memory_swap: z.string().optional().describe('Update only'),
+        limits_memory_swappiness: z.number().optional().describe('Update only'),
+        limits_memory_reservation: z.string().optional().describe('Update only'),
+        limits_cpus: z.string().optional().describe('Update only, e.g. "1.5"'),
+        limits_cpuset: z.string().optional().describe('Update only'),
+        limits_cpu_shares: z.number().optional().describe('Update only'),
         instant_deploy: z.boolean().optional(),
         delete_volumes: z.boolean().optional(),
         // DB-specific optional fields
@@ -1512,7 +1754,7 @@ export class CoolifyMcpServer extends McpServer {
         if (action === 'delete') {
           if (!uuid) return { content: [{ type: 'text' as const, text: 'Error: uuid required' }] };
           return this.guardDestructive(
-            extra.signal,
+            extra.mcpReq.signal,
             `Delete a database, and by default its persistent volumes.`,
             async () => {
               const db = await this.client.getDatabase(uuid);
@@ -1521,7 +1763,70 @@ export class CoolifyMcpServer extends McpServer {
             () => this.client.deleteDatabase(uuid, { deleteVolumes: delete_volumes }),
           );
         }
+        if (action === 'update') {
+          if (!uuid) return { content: [{ type: 'text' as const, text: 'Error: uuid required' }] };
+          // Create-only fields: PATCH /databases/{uuid} rejects unknown keys
+          // with a 422, so strip them here. The rest destructure keeps
+          // `updateData` typed as the remainder of the schema.
+          /* eslint-disable @typescript-eslint/no-unused-vars -- create-only keys are peeled off, not used */
+          const {
+            server_uuid: _server,
+            project_uuid: _project,
+            environment_name: _env,
+            destination_uuid: _dest,
+            instant_deploy: _deploy,
+            ...updateData
+          } = dbData;
+          /* eslint-enable @typescript-eslint/no-unused-vars */
+          // An empty PATCH is a 200 that changed nothing — say so instead.
+          if (Object.values(updateData).every((v) => v === undefined)) {
+            return { content: [{ type: 'text' as const, text: 'Error: nothing to update' }] };
+          }
+          const doUpdate = (): Promise<Database> => this.client.updateDatabase(uuid, updateData);
+          // Two changes earn a confirmation: going public (Docker-network-only
+          // to internet-reachable, the widest non-delete change in the surface)
+          // and rotating a credential (every consumer holding the old value
+          // breaks on the spot). One call can do both, so one prompt must say
+          // both — a dialog that understates the blast radius is worse than none.
+          const exposing = updateData.is_public === true;
+          const rotated = DB_CREDENTIAL_FIELDS.filter((k) => updateData[k] !== undefined);
+          if (exposing || rotated.length > 0) {
+            return this.guardDestructive(
+              extra.mcpReq.signal,
+              exposing ? 'Expose a database on a public port.' : 'Rotate database credentials.',
+              async () => {
+                const db = await this.client.getDatabase(uuid);
+                // Both halves cross into the human's dialog: the name comes from
+                // the instance, the uuid is model-chosen text. Sanitize both.
+                const target = `database "${sanitizeForPrompt(db.name || uuid)}" (${sanitizeForPrompt(uuid)})`;
+                const parts: string[] = [];
+                if (exposing) {
+                  parts.push(
+                    `Expose ${target} on public port ${
+                      updateData.public_port ?? db.public_port ?? '(assigned by Coolify)'
+                    }. It becomes reachable from outside the Docker network.`,
+                  );
+                }
+                if (rotated.length > 0) {
+                  parts.push(
+                    `${exposing ? 'Also rotate' : `Rotate`} ${rotated.join(', ')}${exposing ? '' : ` on ${target}`}. Every application using the current value loses its connection immediately.`,
+                  );
+                }
+                return parts.join('\n\n');
+              },
+              doUpdate,
+            );
+          }
+          return wrap(doUpdate);
+        }
         // create
+        if (dbData.public_port === null) {
+          return {
+            content: [
+              { type: 'text' as const, text: 'Error: public_port cannot be null on create' },
+            ],
+          };
+        }
         if (!type || !args.server_uuid || !args.project_uuid) {
           return {
             content: [
@@ -1539,7 +1844,21 @@ export class CoolifyMcpServer extends McpServer {
           clickhouse: (d) => this.client.createClickhouse(d),
           dragonfly: (d) => this.client.createDragonfly(d),
         };
-        return wrap(() => dbMethods[type](dbData));
+        const doCreate = (): Promise<unknown> => dbMethods[type](dbData);
+        // Same end state as a guarded update — a public database — reached
+        // via create instead, so it gets the same confirmation.
+        if (dbData.is_public === true) {
+          return this.guardDestructive(
+            extra.mcpReq.signal,
+            'Create a database exposed on a public port.',
+            () =>
+              `Create ${sanitizeForPrompt(type)} database "${sanitizeForPrompt(dbData.name ?? '(unnamed)')}" exposed on public port ${
+                dbData.public_port ?? '(assigned by Coolify)'
+              }. It becomes reachable from outside the Docker network.`,
+            doCreate,
+          );
+        }
+        return wrap(doCreate);
       },
     );
 
@@ -1563,7 +1882,7 @@ export class CoolifyMcpServer extends McpServer {
 
     this.defineTool(
       'service',
-      "Manage service: create/update/delete/list_containers/update_application/start_application/stop_application/restart_application. A service is a multi-container stack; `list_containers` returns the applications and databases inside it, whose names are what the `logs` tool needs as `container`. Use `update_application` to change a sub-application's FQDN (url) or other settings. Use `start_application`/`stop_application`/`restart_application` to control sub-application lifecycle.",
+      "Manage service: create/update/delete/list_containers/update_application/start_application/stop_application/restart_application. A service is a multi-container stack; `list_containers` returns the applications and databases inside it, whose names are what the `logs` tool needs as `container`. Use `update_application` to change a sub-application's FQDN (url) or other settings. Use `start_application`/`stop_application`/`restart_application` to control sub-application lifecycle. `update` with `connect_to_docker_network` attaches the stack to the shared `coolify` network so other stacks can reach its containers by name.",
       {
         action: z.enum([
           'create',
@@ -1585,7 +1904,14 @@ export class CoolifyMcpServer extends McpServer {
         type: z.string().optional(),
         server_uuid: z.string().optional(),
         project_uuid: z.string().optional(),
-        environment_name: z.string().optional(),
+        environment_name: z.string().optional().describe('Create: this or environment_uuid'),
+        environment_uuid: z.string().optional().describe('Create: this or environment_name'),
+        destination_uuid: z
+          .string()
+          .optional()
+          .describe(
+            'Destination UUID (create only). Required if the server has multiple destinations — find it with `list_destinations`.',
+          ),
         name: z.string().optional(),
         description: z.string().optional(),
         instant_deploy: z.boolean().optional(),
@@ -1593,6 +1919,18 @@ export class CoolifyMcpServer extends McpServer {
           .string()
           .optional()
           .describe('Raw docker-compose YAML for custom services (auto base64-encoded)'),
+        connect_to_docker_network: z
+          .boolean()
+          .optional()
+          .describe(
+            'Attach the stack to the shared `coolify` Docker network (update only). Needed for cross-stack traffic by container name.',
+          ),
+        is_container_label_escape_enabled: z
+          .boolean()
+          .optional()
+          .describe(
+            'Set false before writing Traefik basic-auth labels, or Coolify double-escapes the $ in htpasswd hashes. Accepted on create and update.',
+          ),
         delete_volumes: z.boolean().optional(),
         url: z
           .string()
@@ -1646,22 +1984,34 @@ export class CoolifyMcpServer extends McpServer {
                 name: args.name,
                 description: args.description,
                 environment_name: args.environment_name,
+                environment_uuid: args.environment_uuid,
+                destination_uuid: args.destination_uuid,
                 instant_deploy: args.instant_deploy,
                 docker_compose_raw: args.docker_compose_raw,
+                is_container_label_escape_enabled: args.is_container_label_escape_enabled,
               }),
             );
           case 'update': {
             if (!uuid)
               return { content: [{ type: 'text' as const, text: 'Error: uuid required' }] };
-            // eslint-disable-next-line @typescript-eslint/no-unused-vars
-            const { action: _, uuid: __, delete_volumes: ___, ...updateData } = args;
+            const updateData: UpdateServiceRequest = {
+              name: args.name,
+              description: args.description,
+              docker_compose_raw: args.docker_compose_raw,
+              connect_to_docker_network: args.connect_to_docker_network,
+              instant_deploy: args.instant_deploy,
+              is_container_label_escape_enabled: args.is_container_label_escape_enabled,
+            };
+            if (Object.values(updateData).every((v) => v === undefined)) {
+              return { content: [{ type: 'text' as const, text: 'Error: nothing to update' }] };
+            }
             return wrap(() => this.client.updateService(uuid, updateData));
           }
           case 'delete':
             if (!uuid)
               return { content: [{ type: 'text' as const, text: 'Error: uuid required' }] };
             return this.guardDestructive(
-              extra.signal,
+              extra.mcpReq.signal,
               `Delete a service, and by default its persistent volumes.`,
               async () => {
                 const svc = await this.client.getService(uuid);
@@ -1696,7 +2046,7 @@ export class CoolifyMcpServer extends McpServer {
               });
             if (args.force_domain_override) {
               return this.guardDestructive(
-                extra.signal,
+                extra.mcpReq.signal,
                 'Override domain for service sub-application, potentially taking the domain from another resource.',
                 () =>
                   `Update sub-application ${appUuid} in service ${uuid} with force_domain_override=true. This may pull a live domain off another resource.`,
@@ -1870,15 +2220,48 @@ export class CoolifyMcpServer extends McpServer {
         // On `list`, an optional `key` narrows the response to that single
         // variable. This matters most with reveal=true: without it, asking
         // for one value dumps every secret on the resource to the MCP client.
-        const filterByKey = <T extends { key: string }>(vars: T[]): T[] =>
-          key ? vars.filter((v) => v.key === key) : vars;
+        if (action === 'list' && reveal === true && !key?.trim()) {
+          return {
+            content: [
+              {
+                type: 'text' as const,
+                text: 'Error: reveal=true requires an exact key; refusing to return every environment variable',
+              },
+            ],
+          };
+        }
+        const hasReturnedValue = (value: unknown): boolean =>
+          value !== undefined && value !== null && value !== '***';
+        const filterByKey = <T extends { key: string; value?: string; real_value?: string }>(
+          vars: T[],
+        ): T[] => {
+          const filtered = key ? vars.filter((v) => v.key === key) : vars;
+          // `every`, not `some`: Coolify auto-creates a preview twin for each
+          // production application env var (#291), so an exact-key filter
+          // legitimately yields two rows, and one of them carrying the value
+          // is a successful read. v4.2 withholding strips every row, which
+          // this still catches.
+          if (
+            reveal === true &&
+            filtered.length > 0 &&
+            filtered.every((v) => !hasReturnedValue(v.value) && !hasReturnedValue(v.real_value))
+          ) {
+            throw new Error(
+              'Coolify did not return the requested environment variable value. The API or token does not support sensitive env-var reads; use a token with read:sensitive permission (and the required owner/admin role on newer Coolify versions).',
+            );
+          }
+          return filtered;
+        };
 
         if (resource === 'application') {
           switch (action) {
             case 'list':
               return wrap(async () =>
                 filterByKey(
-                  await this.client.listApplicationEnvVars(uuid, { summary: true, reveal }),
+                  await this.client.listApplicationEnvVars(uuid, {
+                    summary: !(reveal === true && Boolean(key?.trim())),
+                    reveal,
+                  }),
                 ),
               );
             case 'create':
@@ -2060,11 +2443,12 @@ export class CoolifyMcpServer extends McpServer {
         action: z.enum(['get', 'cancel', 'list_for_app']),
         uuid: z.string(),
         lines: z.number().optional(), // Include logs truncated to last N entries (omit for no logs)
-        page: z.number().optional(), // Log page (1=most recent, 2=older, etc.)
+        page: z.number().int().positive().optional(), // Log page for get; deployment page for list_for_app
+        per_page: z.number().int().positive().optional(), // list_for_app page size (default 10)
         max_chars: z.number().optional(), // Limit log output to last N chars (default: 50000)
         include_logs: z.boolean().optional(), // list_for_app only: include raw build logs (default false; upstream returns ~30KB per deployment)
       },
-      async ({ action, uuid, lines, page, max_chars, include_logs }) => {
+      async ({ action, uuid, lines, page, per_page, max_chars, include_logs }) => {
         switch (action) {
           case 'get':
             // If lines param specified, include logs and truncate
@@ -2130,6 +2514,8 @@ export class CoolifyMcpServer extends McpServer {
             return wrap(async () => {
               const result = await this.client.listApplicationDeployments(uuid, {
                 includeLogs: include_logs,
+                ...(page !== undefined && { page }),
+                ...(per_page !== undefined && { perPage: per_page }),
               });
               // include_logs pulls raw build output onto each row — same
               // attacker-influenceable surface as the other log paths (FINDINGS #4).
@@ -2190,7 +2576,7 @@ export class CoolifyMcpServer extends McpServer {
               return wrap(() => this.client.updatePrivateKey(uuid, { name, description }));
             }
             return this.guardDestructive(
-              extra.signal,
+              extra.mcpReq.signal,
               `Replace an SSH private key's material. The current key is not recoverable.`,
               async () => {
                 const key = await this.client.getPrivateKey(uuid);
@@ -2214,7 +2600,7 @@ export class CoolifyMcpServer extends McpServer {
             // unguarded on purpose; a prompt on every delete is how prompts
             // stop being read.
             return this.guardDestructive(
-              extra.signal,
+              extra.mcpReq.signal,
               `Delete an SSH private key. Not recoverable from Coolify.`,
               async () => {
                 const key = await this.client.getPrivateKey(uuid);
@@ -2330,7 +2716,7 @@ export class CoolifyMcpServer extends McpServer {
             // sourced from the installation — they all lose their deploy
             // source at once — and it is countable, so the prompt counts it.
             return this.guardDestructive(
-              extra.signal,
+              extra.mcpReq.signal,
               `Delete a GitHub app installation. Every application sourced from it loses its deploy source.`,
               async () => {
                 // Full objects, necessarily: toApplicationSummary drops both
@@ -2554,7 +2940,7 @@ export class CoolifyMcpServer extends McpServer {
             // write-only in Coolify, so deletion is irreversible without the
             // original credential.
             return this.guardDestructive(
-              extra.signal,
+              extra.mcpReq.signal,
               `Delete a cloud-provider API token. Not recoverable from Coolify.`,
               async () => {
                 const stored = await this.client.getCloudToken(uuid);
@@ -2919,7 +3305,7 @@ export class CoolifyMcpServer extends McpServer {
             // turns it back on. Recovery is a trip to the Coolify UI, so this
             // is precisely a decision a human should be making.
             return this.guardDestructive(
-              extra.signal,
+              extra.mcpReq.signal,
               `Disable the Coolify API, which stops every tool in this server.`,
               () =>
                 `Disable the Coolify API?\n\n` +
@@ -3044,7 +3430,7 @@ export class CoolifyMcpServer extends McpServer {
         // The cost is one extra lookup on an already-failing request.
         let approved: Application[] | undefined;
         return this.guardDestructive(
-          extra.signal,
+          extra.mcpReq.signal,
           `Restart every application in a Coolify project.`,
           async () => {
             approved = await this.client.applicationsInProject(project_uuid);
@@ -3082,7 +3468,7 @@ export class CoolifyMcpServer extends McpServer {
           );
         }
         return this.guardDestructive(
-          extra.signal,
+          extra.mcpReq.signal,
           `Set env var "${sanitizeForPrompt(key)}" across ${app_uuids.length} applications.`,
           // Every other prompt names what it is about to touch, and this is the
           // one where that matters most: `app_uuids` is a list the *model*
@@ -3146,7 +3532,7 @@ export class CoolifyMcpServer extends McpServer {
         // set itself.
         let approved: Application[] | undefined;
         return this.guardDestructive(
-          extra.signal,
+          extra.mcpReq.signal,
           `EMERGENCY STOP: stop every running application on this Coolify instance.`,
           async () => {
             const apps = (await this.client.listApplications()) as Application[];
@@ -3200,7 +3586,7 @@ export class CoolifyMcpServer extends McpServer {
       async ({ project_uuid, force }, extra) => {
         let approved: Application[] | undefined;
         return this.guardDestructive(
-          extra.signal,
+          extra.mcpReq.signal,
           `Redeploy every application in a Coolify project.`,
           async () => {
             approved = await this.client.applicationsInProject(project_uuid);

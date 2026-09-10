@@ -7,9 +7,91 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fork compatibility
+
+- Preserve `verify_app_environment` and its minimal `{ identity, name }` response as a compatibility wrapper over upstream `environments` / `verify_app`; retain strict exact-anchor validation before API requests.
+
+### Changed
+
+- **Docs restructured for 3.x.** The README is now the front door only: three install paths (one-click, local, remote), "then run doctor", what it does, fleet and safety in a paragraph each, every one linking out. The reference moved into `docs/`: `tools.md` (the full table, how the surface is shaped, version compatibility, the gotchas the tools absorb), `fleet.md`, `doctor.md`, `security.md` (the elicitation and masking write-ups, verbatim from the old README), alongside the existing `http-mode.md`. The v2-era `## Design` token pitch is gone from the README; `docs/V3.md` retired to `docs/history/`. Less prose, more structure.
+- **Tool count has one source of truth.** `npm run check:tool-count` (CI-gated; `--fix` rewrites) compares every "N tools" claim in README, CLAUDE.md, `package.json`, `server.json` and `manifest.json` against the evals roster snapshot — the tools a default install actually exposes. The site's count now reads the same roster instead of counting `defineTool` registrations, which since 3.1 would have advertised the fleet-only `list_instances` to single-instance visitors.
+- **Site** (coolify-mcp.stumason.dev): Install covers remote/OAuth and fleet and ends with doctor; a Docs section links the reference; JSON-LD `softwareVersion` is read from `package.json` at build (it said 2.17.0); `/llms.txt` and `/llms-full.txt` are generated from README and `docs/` at build for clients reading the site on someone's behalf.
+
 ### Added
 
-- **Exact application-environment verification without enumeration.** The new read-only `verify_app_environment` tool requires an application UUID, project UUID and expected environment name, reads only those exact application and environment endpoints, and returns a minimal identity proof. UUID, project, environment name and numeric environment identity drift all fail closed; embedded environment resources and configuration never enter the tool response.
+- `SECURITY.md`, and private vulnerability reporting enabled on the repository.
+
+## [3.1.0] - 2026-09-09
+
+The fleet release. One server can now manage several Coolify instances, with every tool taking an `instance` and every destructive confirmation naming the one it targets — and a `doctor` command that turns "it's broken" into a one-line fix, because most reports of a broken MCP were the environment, not the server. Cloudflare Access service tokens, a startup self-check, and two contributor fixes round it out.
+
+Thanks to the people whose reports and PRs shaped this release: @Tchorizo (#364), @ninelhodzic (#345), @mediafill (#164, the original fleet ask), @StreamlinedStartup (the #292 audit doctor now runs itself), the hospital-reunioes, Clawith and herdctl teams whose failure stories became doctor's checks, and @ubranch, @daniel-rudaev, @follox42, @kashik0i and @rudo50647 whose estates set the bar for fleet mode.
+
+### Upgrading from 3.0
+
+- **Drop-in.** Single-instance configs are byte-identical on `tools/list`; no config changes, no new arguments, no new tools until you add `COOLIFY_INSTANCES`.
+- **One behaviour change:** `env_vars` with `reveal: true` now requires a `key`. Bulk plaintext reads of every variable are rejected — read one variable at a time.
+- **New commands:** `npx @masonator/coolify-mcp doctor` (add `--json`) verifies a setup end to end. Run it first when anything looks wrong.
+
+### Added
+
+- **`environments { action: 'verify_app' }`** (#345, @ninelhodzic): prove that one exact application is bound to one exact environment of one exact project, using only the application-detail and project/environment endpoints — never a list — and fail closed on any drift (application uuid, `environment_id`, environment name, project). Returns `{ verified, application_uuid, environment: { id, uuid, name } }` so a pre-mutation guard needs one call, not three. Folded into `environments` rather than shipped as a 46th tool, because every top-level tool costs tokens on every session.
+
+- **`doctor` CLI** (#368): `npx @masonator/coolify-mcp doctor` (or `--json`) turns "it's broken" into a one-line fix. Checks: config shapes (the startup self-check plus required-var presence), Coolify reachability with response time — naming **Cloudflare Access interception** specifically when the wall is a 302 to the Access login page; token acceptance; Coolify version against the tested range (4.0.x – 4.3.x); the token's **abilities** — `read` proven by the token check, `deploy` via a side-effect-free probe of the ability-gated `GET /deploy` (no params, so no controller can act), distinguishing a missing ability from Coolify's Member-role hard block by the upstream 403 body; `write` is reported as undetermined, honestly, because Coolify has neither a token-introspection endpoint (#369) nor any write-gated GET that could be probed without side effects; and whether the API routing catch-all still has the shape our v4.2 method-fallback detection reads (#292's audit, running itself). Every check reports pass/warn/fail/skipped with a fix line; exit code 1 on any failure; no secret is ever printed — variable names and statuses only. Credit to the failure reports that shaped the checks: pedrorezendefig/hospital-reunioes#312 (the Keychain `${VAR}` story), dataelement/Clawith#717, edspencer/herdctl#182, and @StreamlinedStartup's #292 audit.
+
+- **Fleet mode** (#367): one server, several Coolify instances. `COOLIFY_INSTANCES` (a JSON array of `{name, url, token[, headers]}`) adds instances next to the existing single-instance vars, which define the default. With more than one instance every tool gains an optional `instance` argument (omitted = default; unknown = rejected with the valid names before any request), `list_instances` reports name/URL/default/live version (never a token), and every destructive confirmation names the instance it targets. Each instance has its own `CoolifyClient`, so version-era handling and the v4.2 method-fallback cache stay per instance. Single-instance configs are byte-for-byte unchanged on `tools/list` — the fleet surface only exists once there is something to choose between, which is also how the ~7.7k-token single-instance tool list stays inside its gate while the fleet list gets its own budget. Trust model: a fleet is one trust domain; HTTP mode's proof of access validates against the default instance only, and agencies with a Coolify per client should run a server per client. Asked for by @mediafill (#164), and shaped by the estates of @ubranch, @daniel-rudaev, @follox42, @kashik0i and @rudo50647.
+
+- **Startup config self-check** (#368, first slice). Both entry points now inspect the environment before serving anything and say what is wrong with it on stderr: an unexpanded `${VAR}` placeholder that a launcher failed to substitute (the macOS Keychain failure that cost one team their whole integration), a line break pasted into the token or a header credential (fetch would refuse to send it), leading whitespace on the token (it becomes part of the credential and 401s every call — trailing whitespace is normalized away by fetch and deliberately not flagged), an unusable `COOLIFY_BASE_URL`, or a base URL that already ends in `/api/v1` (the server appends that itself, so every call would 404). Fatal problems are listed together and refuse startup; survivable ones print as warnings. Messages name the variable and the shape of the problem — never the value.
+- **Cloudflare Access service tokens for the Coolify base URL** (#373). If your Coolify control plane sits behind Cloudflare Access, set `CF_ACCESS_CLIENT_ID` and `CF_ACCESS_CLIENT_SECRET` (Cloudflare's own names) and every request to `COOLIFY_BASE_URL` — tool calls and HTTP mode's authorize-time token validation alike — carries the `CF-Access-Client-Id`/`CF-Access-Client-Secret` headers. The headers attach to base-URL requests only, never to any other fetch. Setting one variable without the other is a startup error (both or neither). Documented in `docs/http-mode.md`, including the internal-Docker-network alternative that avoids Cloudflare entirely when the container runs next to Coolify.
+
+### Changed
+
+- **`env_vars` rejects `reveal: true` without a `key`** (#364, @Tchorizo). Bulk plaintext reads of every variable were the one call whose failure mode is dumping every secret; reveal now requires the exact key you want. Read one variable at a time, and expect two rows per key on applications (production + preview twin).
+
+### Fixed
+
+- **`env_vars` exact-key reveal now returns a value or a capability error** (Tchori-Labs/infra#137). Application lists request the full env-var representation when `key` and `reveal: true` are supplied, then filter to that exact key. Reveal without a key is rejected before the API call, and APIs/tokens that omit both `value` and `real_value` return a clear sensitive-read capability error instead of claiming success. Coolify exposes only the collection env endpoint; there is no supported per-variable GET or reveal query flag.
+- **`docs/http-mode.md` no longer tells you to deploy the retired `v3` branch.** HTTP mode ships on `main` since 3.0.0; the guide and its restart-loop troubleshooting entry now say so.
+
+## [3.0.0] - 2026-09-08
+
+The remote release. 3.0 can run as a container inside your Coolify instance and serve remote MCP clients over Streamable HTTP behind OAuth 2.1 — claude.ai, Claude Desktop and Claude Code all connect with nothing installed locally. For stdio users nothing moves: same entry point, same tools (now 45), and the wire-visible change from the SDK swap is limited to the declared JSON Schema draft.
+
+### Upgrading from 2.x
+
+- **stdio (npx / MCPB / local config): drop-in.** `dist/index.js` is untouched; HTTP mode is a second, additive entry point (`dist/http.js`). No config changes required.
+- **The 2.x line moves to the `v2` branch** and receives security-only backports until the end of January 2027. New features land on 3.x only.
+- **HTTP mode token lifecycle, if you deploy it:** refresh tokens rotate on every use, and a replayed (already-used) refresh token revokes the whole token family — that is reuse detection working, not a bug. The refresh TTL is 8 hours, rolling: clients in active use never re-authenticate; a client idle for more than 8 hours signs in again.
+- **Remote clients cannot run destructive operations in 3.0.** Confirmation prompts (elicitation) fail closed over HTTP, so delete/stop-all class tools refuse rather than act unconfirmed. Use stdio for destructive work, or wait for a 3.x that carries a remote confirmation path. `MCP_READONLY=true` serves an observability-only surface.
+
+### Added
+
+- **HTTP mode (#303): run the server as a container inside Coolify and connect remote MCP clients over Streamable HTTP with OAuth 2.1.** A second entry point (`dist/http.js`, additive; stdio is untouched) serves the same 45 tools behind a built-in OAuth 2.1 authorization server: dynamic client registration (RFC 7591), PKCE-required authorization code flow, rotating refresh tokens with reuse detection, audience-bound opaque tokens (RFC 8707), and AS/protected-resource metadata discovery (RFC 8414/9728). Authorisation is "Coolify token as proof of access": at authorize time you present your own Coolify API token, the container validates it against `GET /teams/current` and discards it — the container acts only with its env-configured token, no client ever receives a Coolify credential, and there is no secrets store (the state volume holds registered clients and token hashes only). In HTTP mode destructive operations require a human via elicitation (fail closed), and `MCP_READONLY=true` serves an observability-only surface by never registering mutating tools. Ships with a Dockerfile, a GHCR image workflow, and a Coolify compose template — see `docs/http-mode.md`.
+
+- **Three Coolify API parameters the tools never exposed** (#351, reported by a field-tester on 2.19.3). `service create` now takes `destination_uuid` (and `environment_uuid`) — on a server with more than one Docker network `POST /services` refuses without it, so creating a service there was impossible through the MCP even though `application` and `database` already accepted it. `database` gains an `update` action over the existing `PATCH /databases/{uuid}` client method, which is how you expose an existing database on a public port (`is_public` + `public_port`) or change its limits and credentials; `public_port: null` clears an assigned port, and create-only fields are stripped before the PATCH. `service create` and `update` now take `is_container_label_escape_enabled`; `service update` also takes `connect_to_docker_network`, the toggle that attaches a stack to the shared `coolify` network so two stacks can resolve each other by container name, (the label-escape flag is the Traefik basic-auth prerequisite that was documented as UI-only). The update payload is an explicit pick now instead of every tool argument spread into the PATCH. Going public (`is_public: true`, on `database update` or `create`) asks for confirmation like a delete does, since it is the widest non-delete change in the surface; changing any credential (user or password) on `update` asks for confirmation too, since every app holding the old value breaks on the spot; one call that both exposes and rotates gets one prompt naming both, and an `update` with nothing to change is refused instead of sending an empty PATCH. New read-only `list_destinations` tool (`GET /destinations`, or `/servers/{uuid}/destinations` with `server_uuid`; Coolify v4.2+, older instances 404) so the `destination_uuid` value is discoverable without the browser.
+
+### Changed
+
+- **SDK v2 (`@modelcontextprotocol/server`)** (#259): the stateless split-package core replaces `@modelcontextprotocol/sdk`. Tool surface is unchanged; the only wire-visible difference is the declared JSON Schema draft on `tools/list` (draft-07 → 2020-12).
+
+### Security
+
+- **Lockfile bumped past four npm advisories** (#363, applied on the 2.x line and carried here). `npm audit fix` for `fast-uri` (high: SSRF and host-confusion, GHSA-5jgf/f65p/fph4/jqff), `qs` and `@humanfs/node` (moderate). On 2.x this only unblocked the CI audit gate — the stdio server never loads the SDK's express paths. In 3.0's HTTP mode the express stack is live, so these resolutions (and the `body-parser` fix this branch's tree already carries) are load-bearing, not just hygiene.
+
+## [2.19.4] - 2026-08-22
+
+The field-test follow-ups from #336, contributed by the field-tester. The headline is an upstream bug: `GET /databases` can drop whole database types, and `list_databases` now repairs that from `/resources`.
+
+### Fixed
+
+- **`list_databases` no longer silently drops whole database types** (#336, item 1). Coolify keeps a per-type id sequence and `GET /databases` merges the per-type collections keyed on that id, so two types sharing ids shadow each other — verified live upstream: 2 standalone Postgres + 2 standalone Dragonfly, both pairs ids 1 and 2, returned only the Dragonflys. `/resources` reports every database correctly, so `listDatabases` now fetches both and merges the rows `/databases` dropped back in by uuid (every `standalone-*` resource type is a database). The merge is a no-op when `/databases` is complete, and if `/resources` fails the plain `/databases` result is returned unchanged. `get_infrastructure_overview` database counts and `find_issues` database coverage are repaired by the same merge, since both go through `listDatabases`.
+- **`environments get` now honours its own schema** (#336, item 2). The schema has always marked `name` optional, but the handler rejected with `Error: name required`. It now defaults to the sole environment when the project has exactly one; with several (or none) it explains what exists instead of a bare rejection.
+- **`diagnose_app` env-var counts no longer read as a bug** (#336, item 3). Coolify auto-creates a preview twin for every production application env var and the API returns both scopes merged, so the raw count doubles. The diagnostic now surfaces `is_preview` per variable plus `distinct_keys`, `production_count` and `preview_count` alongside the unchanged raw `count`. No row is ever deduped — deleting a twin destroys preview config.
+- **Exact matches win name resolution** (#336, item 4). `diagnose_app` resolved "api.example.com" to a multi-app disambiguation error whenever another app's FQDN contained it as a substring. An exact name or FQDN match (scheme and trailing slash ignored, each entry of a comma-separated `fqdn` compared) now wins outright before substring matching runs; same for `diagnose_server` names and IPs, where "10.0.0.5" is a substring of "10.0.0.50".
+
+### Added
+
+- **`find_issues` folds in signals it already had in hand** (#336, item 5). An app in `running:unknown` and an available proxy patch upgrade used to produce zero findings. Issues now carry a `severity` (`critical` | `warning`): resources running with unknown health warn (running container, no working healthcheck — a failure would go undetected), and servers with an available Traefik update warn with the version pair (`traefik_outdated_info` only exists on `GET /servers/{uuid}`, so each listed server is fetched individually; shape verified live against v4.3.7). The `unhealthy_*`/`unreachable_servers` summary counts keep their pre-existing critical-only meaning; warnings are counted separately in `summary.warnings`.
 
 ## [2.19.3] - 2026-08-06
 
