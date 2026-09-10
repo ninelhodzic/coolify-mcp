@@ -9,7 +9,7 @@
 
 Manage [Coolify](https://coolify.io/) from Claude, Cursor, or any MCP client: 46 tools for deploying, debugging, and operating your self-hosted PaaS in plain English. Destructive operations ask a human first; secrets stay masked.
 
-📖 **[coolify-mcp.stumason.dev](https://coolify-mcp.stumason.dev)** · [Tool reference](docs/tools.md) · [Remote / HTTP mode](docs/http-mode.md) · [Fleet](docs/fleet.md) · [Doctor](docs/doctor.md) · [Safety and security](docs/security.md) · [Changelog](CHANGELOG.md)
+📖 **[coolify-mcp.stumason.dev](https://coolify-mcp.stumason.dev)** · [Tool reference](docs/tools.md) · [Prompts and resources](docs/prompts-and-resources.md) · [Remote / HTTP mode](docs/http-mode.md) · [Fleet](docs/fleet.md) · [Doctor](docs/doctor.md) · [Safety and security](docs/security.md) · [Changelog](CHANGELOG.md)
 
 ## Install
 
@@ -73,6 +73,10 @@ Every tool takes an `action`; run one with no arguments and it lists what it acc
 
 Lists return `uuid`/`name`/`status` summaries, 90–99% smaller than the raw API; `get_*` tools fetch one resource in full. The whole tool list costs about 6,600 tokens of context.
 
+## Workflows, not just tools
+
+Three prompts ship as slash commands: `troubleshoot_application`, `explain_failed_deploy` and `estate_health`. Pick one and the model walks the workflow with the tools it already has. Two resources, `coolify://overview` and `coolify://application/{uuid}`, are reads your client can attach; both go through the same masking as every tool call, and neither offers a way to ask for plaintext. A prompt whose tools are not registered is not listed, so read-only mode never offers a dead end. [Prompts and resources](docs/prompts-and-resources.md).
+
 ## Several Coolify instances
 
 Set `COOLIFY_INSTANCES` to a JSON array of `{ name, url, token }` alongside your default config. Every tool then takes an optional `instance`, `list_instances` reports what is configured, and every destructive confirmation names the instance it targets. Single-instance installs are byte-identical. A fleet is one trust domain; agencies with a Coolify per client should run one server per client. [Fleet guide](docs/fleet.md).
@@ -82,6 +86,28 @@ Set `COOLIFY_INSTANCES` to a JSON array of `{ name, url, token }` alongside your
 Destructive operations stop and ask **you**, in your own client, before anything happens, on clients that support elicitation (Claude Code, VS Code Copilot). In remote mode the guard fails closed. Secrets are masked at the API boundary, log output is wrapped as untrusted data so a poisoned log line cannot issue instructions, and an eval suite red-teams both claims on every change. [Details](docs/security.md).
 
 Works against Coolify v4.0 through v4.3. The v4.2 GET-to-POST change and the v4.2 secrets and Member-role restrictions are handled; see [compatibility](docs/tools.md#coolify-version-compatibility).
+
+## Coolify's own MCP server, and when you want this one
+
+Coolify ships an MCP server of its own, built into the product. Enable it in **Settings → Advanced** (and per team), point your client at `https://your-coolify/mcp`, and there is nothing to install: it runs inside the instance, so no third-party code ever holds your token. If you run one Coolify, with one team, and you mostly want to ask it questions, use that. It is the shortest path and it costs you nothing.
+
+At the time of writing Coolify documents its server as read-only, with write operations planned. It is moving quickly, so check [the Coolify docs](https://coolify.io/docs/integrations/mcp) for where it has got to. There is also an [official CLI](https://github.com/coollabsio/coolify-cli) if you would rather script than converse.
+
+This server is for the jobs those two do not cover yet.
+
+|                           | Coolify's built-in `/mcp`     | Official CLI          | This server                                                                                                                    |
+| ------------------------- | ----------------------------- | --------------------- | ------------------------------------------------------------------------------------------------------------------------------ |
+| Where it runs             | Inside your Coolify           | Your shell            | Your machine, or a container inside your Coolify                                                                               |
+| Install                   | Nothing                       | One binary            | `npx`, a one-click Claude Desktop extension, or a container                                                                    |
+| Transport                 | Streamable HTTP               | Not an MCP server     | stdio and HTTP, so it also works in clients that only speak stdio                                                              |
+| Coolify instances         | One                           | One context at a time | One or many; in fleet mode every tool takes an `instance`                                                                      |
+| Writes                    | Documented as read-only today | Yes                   | Yes                                                                                                                            |
+| Before a destructive call | Not applicable                | You typed it          | Stops and asks you in your own client, naming the blast radius, on clients that support elicitation; fails closed in HTTP mode |
+| When something is broken  | Not applicable                | Shell exit codes      | `doctor` names the cause and the one-line fix                                                                                  |
+
+A rough rule. One instance and read-only questions, with no setup: use Coolify's. Scripting and CI: use the CLI. Several instances, writes you want a human gate in front of, a client that only speaks stdio, or you want to be told _why_ it is broken: this one.
+
+Other third-party Coolify MCP servers exist. Choose on transport, on how many instances you need to reach from one connection, and on what happens the moment before something is deleted.
 
 ## Example prompts
 

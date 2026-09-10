@@ -51,8 +51,10 @@ When adding new Coolify API endpoints, follow this order:
 
 - **src/index.ts** - Entry point, starts MCP server
 - **src/lib/coolify-client.ts** - HTTP client wrapping Coolify REST API
-- **src/lib/mcp-server.ts** - MCP tool definitions and handlers
+- **src/lib/mcp-server.ts** - MCP tool definitions and handlers, plus prompt and resource registration
+- **src/lib/prompts.ts** - the prompt workflows as pure text builders. They never call the API: `prompts/get` has no error channel a human can act on, and embedding build output in the returned message would put attacker-influenceable text in a user-role message, outside the `asUntrustedLogs` boundary. A prompt may only name tools that are registered in the current mode — `definePrompt`'s `requires` drops the whole prompt, `ctx.has()` drops a single step. See `docs/prompts-and-resources.md`
 - **src/types/coolify.ts** - All Coolify API type definitions
+- **src/data/coolify-docs.json** - the bundled Coolify docs index `search_docs` serves (#372). **Generated** — `npm run docs:index` refreshes it from coolify.io/docs/llms.txt, the publish workflow refreshes it at release time, and a weekly workflow opens a PR when it falls behind. Never hand-edit.
 - **docs/coolify-openapi.yaml** - vendored upstream OpenAPI spec; ground truth for "does Coolify support X"
 - **docs/openapi-chunks/** - the same spec split by resource for reference. **Generated** — run `npm run build:chunks` after re-vendoring the spec, never hand-edit. `npm run check:chunk-drift` fails CI if they diverge.
 
@@ -142,6 +144,7 @@ The Coolify OpenAPI docs are unreliable — always test against the real API. Kn
 - **`delete_volumes` defaults to `true` on every DELETE endpoint.** Applications, databases and services all document `delete_volumes` as an optional query param with `default: true` (`docs/coolify-openapi.yaml`). So **omitting it destroys the data** — the opposite of what an unset optional boolean reads like at a call site. `buildQueryString` drops `undefined`, so "I didn't pass the flag" and "I passed true" hit the same upstream behaviour. Anything that reports to a human what a delete is about to do must treat `undefined` as destructive; only an explicit `false` preserves volumes.
 
 - **`POST /applications/dockercompose` no longer exists upstream.** Coolify deprecated it (`7c0cb2f5`, Jan 2026) and removed the route + controller method entirely (`6ee75cfa`, "remove deprecated docker compose application endpoint") in favour of `POST /services`. The removal shipped in `v4.1.0`, so it 404s against any current self-hosted Coolify release. Compose-based apps are created through the `service` tool / `POST /services` instead. `CoolifyClient#createApplicationDockerCompose` still exists but is deprecated and deliberately NOT exposed as an `application` tool action — do not wire it up (see #235). It only works on instances still on `v4.0.x` or older.
+- **`GET /teams/current` is gone from the spec but not from the router.** The vendored spec (re-vendored 2026-09-09 against upstream `main`, 275 operations) documents `GET /team` and `GET /team/members` instead. Upstream still routes `/teams/current` and `/teams/current/members` as deprecated aliases, and `/team` only exists from Coolify 4.3.0, so the client (`getCurrentTeam`, `getCurrentTeamMembers`) and HTTP mode's proof-of-access (`validateCoolifyToken`) keep calling `/teams/current` while `TESTED_RANGE` in `src/lib/doctor.ts` starts below 4.3. Source: `routes/api.php` at tag `v4.3.0` registers `/team` and `/team/members` (lines 71–72) beside the `/teams/current` aliases (74–75); at `v4.2.0` only `/teams/current` exists (56–57). `check:spec-drift` is method-blind and matches `/teams/current` against `/teams/{id}` by segment count, so it will not flag this; switch to `/team` only when `TESTED_RANGE.min` reaches 4.3.
 
 ## TypeScript Standards
 

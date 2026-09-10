@@ -34,7 +34,7 @@ the table below misses a tool the roster has.
 | **Teams**            | `teams` (list, get, get_members, get_current, get_current_members)                                                                                                        |
 | **Cloud Tokens**     | `cloud_tokens` (Hetzner/DigitalOcean: list, get, create, update, delete, validate)                                                                                        |
 | **Hetzner Cloud**    | `hetzner` (list_locations, list_server_types, list_images, list_ssh_keys, create_server)                                                                                  |
-| **Documentation**    | `search_docs` (full-text search across Coolify docs)                                                                                                                      |
+| **Documentation**    | `search_docs` (search across the Coolify docs index, bundled so it works offline)                                                                                         |
 
 With two or more instances configured ([fleet mode](fleet.md)) every tool
 also takes an optional `instance`, and one extra tool, `list_instances`,
@@ -57,6 +57,10 @@ appears. Single-instance installs never see either.
 - **Verified deploys.** `deploy` with `wait: true` polls to a terminal status
   and returns a log tail on failure, instead of "the site returns 200 so it
   probably worked".
+- **Oriented.** The server's `instructions` field (sent on `initialize`,
+  before any tool definition) describes this shape, the safety boundary and
+  the version-sensitive calls, so a client that defers tool definitions still
+  starts with the map. Snapshotted in `evals/` like the tool list.
 - **Measured.** Tool descriptions are prompts, so `evals/` checks that a model
   picks the right tool from this surface and that attacker-controlled tool
   output cannot make it misbehave. See [evals/README.md](../evals/README.md).
