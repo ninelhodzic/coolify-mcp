@@ -8,6 +8,9 @@ import type {
   ErrorResponse,
   DeleteOptions,
   MessageResponse,
+  MoveResourceResponse,
+  VolumeBackupScheduleRequest,
+  VolumeBackupScheduleResponse,
   UuidResponse,
   // Server types
   Server,
@@ -120,6 +123,7 @@ import type {
   Tag,
   AttachTagsRequest,
 } from '../types/coolify.js';
+import { TokenSource } from './token-source.js';
 import { isRoutingCatchAllBody } from './api-shape.js';
 
 // =============================================================================
@@ -345,6 +349,25 @@ export function errorHint(status: number, path: string): string | undefined {
     // Both causes look identical from the status, so name both rather than
     // pointing confidently at the wrong one.
     return 'Tag endpoints require Coolify v4.2+ (coollabsio/coolify#9275) — check with get_version. If your instance is already v4.2+, the uuid may belong to a different resource type than this route.';
+  }
+  if (status === 404 && /\/move$/.test(path)) {
+    // `/move` is new in v4.2 and never existed before it, so there is no method
+    // to fall back to — an older instance simply has no such route and answers
+    // through `Route::any('/{any}')`. Without this branch the generic
+    // uuid-mismatch hint below claims the uuid is the wrong type, which sends
+    // the reader looking for a problem that is not there.
+    return 'Moving a resource between environments requires Coolify v4.2+ (POST /move, coollabsio/coolify#8968) — check with `get_version`; on an older instance the route does not exist at all. If your instance is already v4.2+, the resource uuid or the target environment_uuid may be wrong, or belong to a different resource type than this route. Upgrade: `curl -fsSL https://cdn.coollabs.io/coolify/install.sh | bash -s 4.2.0`';
+  }
+  if (status === 404 && /\/storages\/[\w-]+\/backups(\/run)?$/.test(path)) {
+    // Volume backup schedules are v4.2+ and simply absent before it, so an
+    // older instance answers through the routing catch-all. Without this the
+    // generic uuid-mismatch branch below claims the uuid is the wrong resource
+    // type, which is the same misleading message `/move` used to give.
+    //
+    // The `/storages/` segment is what keeps this off `/databases/{uuid}/backups`
+    // — that is the long-standing database dump schedule, which exists on 4.0
+    // and must not be told it needs 4.2.
+    return 'Volume backup schedules require Coolify v4.2+ (coollabsio/coolify volume backups) — check with `get_version`; on an older instance the route does not exist at all. If your instance is already v4.2+, the resource uuid or storage_uuid may be wrong. Note this is different from `database_backups`, which schedules database dumps and works on older versions. Upgrade: `curl -fsSL https://cdn.coollabs.io/coolify/install.sh | bash -s 4.2.0`';
   }
   if (status === 404 && /\/[\w-]{8,}(\/|$)/.test(path)) {
     return 'The uuid may belong to a different resource type than requested (e.g. an application uuid used on a service/database route).';
@@ -693,7 +716,7 @@ function deepSanitize(value: unknown, reveal: boolean): unknown {
  */
 export class CoolifyClient {
   private readonly baseUrl: string;
-  private readonly accessToken: string;
+  private readonly tokens: TokenSource;
   private readonly customHeaders: Record<string, string>;
   private cachedVersion: string | null = null;
 
@@ -708,11 +731,9 @@ export class CoolifyClient {
     if (!config.baseUrl) {
       throw new Error('Coolify base URL is required');
     }
-    if (!config.accessToken) {
-      throw new Error('Coolify access token is required');
-    }
+    // Throws when neither a token nor a readable token file is configured.
+    this.tokens = new TokenSource(config);
     this.baseUrl = config.baseUrl.replace(/\/$/, '');
-    this.accessToken = config.accessToken;
 
     const reserved = new Set(['authorization', 'content-type']);
     const raw = config.customHeaders ?? {};
@@ -731,7 +752,30 @@ export class CoolifyClient {
   // Private HTTP methods
   // ===========================================================================
 
+  /**
+   * One retry, only on 401, and only when a re-read actually produced a
+   * different token (#398).
+   *
+   * All three conditions matter. Retrying anything but a 401 could double-fire
+   * a state change. Retrying a 401 unconditionally turns a genuinely bad token
+   * into two failed calls per tool instead of one. And re-reading is pointless
+   * unless the token moved, which is why `refresh()` reports whether it did.
+   */
   private async request<T>(
+    path: string,
+    options: RequestInit = {},
+    sanitize?: { reveal?: boolean },
+  ): Promise<T> {
+    try {
+      return await this.attempt<T>(path, options, sanitize);
+    } catch (error) {
+      if (!(error instanceof CoolifyApiError) || error.status !== 401) throw error;
+      if (!this.tokens.refresh().changed) throw error;
+      return this.attempt<T>(path, options, sanitize);
+    }
+  }
+
+  private async attempt<T>(
     path: string,
     options: RequestInit = {},
     sanitize?: { reveal?: boolean },
@@ -743,7 +787,7 @@ export class CoolifyClient {
         ...options,
         headers: {
           'Content-Type': 'application/json',
-          Authorization: `Bearer ${this.accessToken}`,
+          Authorization: `Bearer ${this.tokens.current()}`,
           ...this.customHeaders,
           ...options.headers,
         },
@@ -907,7 +951,10 @@ export class CoolifyClient {
     const url = `${this.baseUrl}/api/v1/version`;
     const response = await fetch(url, {
       headers: {
-        Authorization: `Bearer ${this.accessToken}`,
+        // Current token, but no 401 retry: this path calls fetch() directly
+        // rather than through request(), because /version answers in plain
+        // text. A version probe is not worth a second round trip.
+        Authorization: `Bearer ${this.tokens.current()}`,
         ...this.customHeaders,
       },
     });
@@ -1265,6 +1312,45 @@ export class CoolifyClient {
       body: JSON.stringify(payload),
     });
     return app;
+  }
+
+  /**
+   * Move a resource to another environment (Coolify v4.2+).
+   *
+   * Each collection is a LITERAL at its own `this.request()` call site rather
+   * than a shared helper taking `collection` as a parameter. The DRY version
+   * reads better and silently weakens the gate: `check:spec-drift` extracts the
+   * template passed to `this.request()` and turns every `${...}` into a wildcard
+   * segment, so `/${collection}/${uuid}/move` collapses to a two-wildcard path
+   * ending in `move` — one route that matches any of the three, and therefore
+   * proves none of them.
+   *
+   * Sent as an unconditional POST. Unlike the enable/disable/validate group,
+   * `/move` has no pre-4.2 GET form, so {@link postWithLegacyGetFallback} would
+   * be wrong here: a retry could only ever hit the same absent route, and on an
+   * instance that did route it a second call would be a second move. An older
+   * instance surfaces the catch-all 404, which {@link errorHint} turns into a
+   * version message.
+   */
+  async moveApplication(uuid: string, environmentUuid: string): Promise<MoveResourceResponse> {
+    return this.request<MoveResourceResponse>(`/applications/${uuid}/move`, {
+      method: 'POST',
+      body: JSON.stringify({ environment_uuid: environmentUuid }),
+    });
+  }
+
+  async moveDatabase(uuid: string, environmentUuid: string): Promise<MoveResourceResponse> {
+    return this.request<MoveResourceResponse>(`/databases/${uuid}/move`, {
+      method: 'POST',
+      body: JSON.stringify({ environment_uuid: environmentUuid }),
+    });
+  }
+
+  async moveService(uuid: string, environmentUuid: string): Promise<MoveResourceResponse> {
+    return this.request<MoveResourceResponse>(`/services/${uuid}/move`, {
+      method: 'POST',
+      body: JSON.stringify({ environment_uuid: environmentUuid }),
+    });
   }
 
   async deleteApplication(uuid: string, options?: DeleteOptions): Promise<MessageResponse> {
@@ -2068,6 +2154,97 @@ export class CoolifyClient {
     return this.request<MessageResponse>(`/applications/${uuid}/storages`, {
       method: 'PATCH',
       body: JSON.stringify(data),
+    });
+  }
+
+  // ---------------------------------------------------------------------------
+  // Volume backup schedules (Coolify v4.2+, #305)
+  //
+  // Written out per resource type with the collection as a LITERAL, rather than
+  // shared through one helper taking `collection` as a parameter. The DRY version
+  // reads better and is wrong: `check:spec-drift` extracts the template passed to
+  // `this.request()` and turns every `${...}` into a wildcard segment, so
+  // `/${collection}/${uuid}/storages/${storageUuid}/backups` collapses to
+  // `/*/*/storages/*/backups` — one route that matches any of the three, proving
+  // none of them. Three literal call sites are three checked routes.
+  //
+  // There is deliberately no `get`/`list` here. Upstream's VolumeBackupsController
+  // defines only PUT, DELETE and the run POST — no GET route for a schedule exists
+  // — and the storages listing returns the raw volume models without the backup
+  // relation loaded. "Does this volume have a backup?" is unanswerable through the
+  // Coolify API today, not merely unimplemented here.
+  // ---------------------------------------------------------------------------
+
+  async setApplicationStorageBackup(
+    uuid: string,
+    storageUuid: string,
+    schedule: VolumeBackupScheduleRequest,
+  ): Promise<VolumeBackupScheduleResponse> {
+    return this.request<VolumeBackupScheduleResponse>(
+      `/applications/${uuid}/storages/${storageUuid}/backups`,
+      { method: 'PUT', body: JSON.stringify(cleanRequestData(schedule)) },
+    );
+  }
+
+  async setDatabaseStorageBackup(
+    uuid: string,
+    storageUuid: string,
+    schedule: VolumeBackupScheduleRequest,
+  ): Promise<VolumeBackupScheduleResponse> {
+    return this.request<VolumeBackupScheduleResponse>(
+      `/databases/${uuid}/storages/${storageUuid}/backups`,
+      { method: 'PUT', body: JSON.stringify(cleanRequestData(schedule)) },
+    );
+  }
+
+  async setServiceStorageBackup(
+    uuid: string,
+    storageUuid: string,
+    schedule: VolumeBackupScheduleRequest,
+  ): Promise<VolumeBackupScheduleResponse> {
+    return this.request<VolumeBackupScheduleResponse>(
+      `/services/${uuid}/storages/${storageUuid}/backups`,
+      { method: 'PUT', body: JSON.stringify(cleanRequestData(schedule)) },
+    );
+  }
+
+  async deleteApplicationStorageBackup(
+    uuid: string,
+    storageUuid: string,
+  ): Promise<MessageResponse> {
+    return this.request<MessageResponse>(`/applications/${uuid}/storages/${storageUuid}/backups`, {
+      method: 'DELETE',
+    });
+  }
+
+  async deleteDatabaseStorageBackup(uuid: string, storageUuid: string): Promise<MessageResponse> {
+    return this.request<MessageResponse>(`/databases/${uuid}/storages/${storageUuid}/backups`, {
+      method: 'DELETE',
+    });
+  }
+
+  async deleteServiceStorageBackup(uuid: string, storageUuid: string): Promise<MessageResponse> {
+    return this.request<MessageResponse>(`/services/${uuid}/storages/${storageUuid}/backups`, {
+      method: 'DELETE',
+    });
+  }
+
+  async runApplicationStorageBackup(uuid: string, storageUuid: string): Promise<MessageResponse> {
+    return this.request<MessageResponse>(
+      `/applications/${uuid}/storages/${storageUuid}/backups/run`,
+      { method: 'POST' },
+    );
+  }
+
+  async runDatabaseStorageBackup(uuid: string, storageUuid: string): Promise<MessageResponse> {
+    return this.request<MessageResponse>(`/databases/${uuid}/storages/${storageUuid}/backups/run`, {
+      method: 'POST',
+    });
+  }
+
+  async runServiceStorageBackup(uuid: string, storageUuid: string): Promise<MessageResponse> {
+    return this.request<MessageResponse>(`/services/${uuid}/storages/${storageUuid}/backups/run`, {
+      method: 'POST',
     });
   }
 

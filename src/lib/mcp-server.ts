@@ -13,6 +13,9 @@ import type {
   ToolCallback,
   ListResourcesResult,
   ReadResourceResult,
+  InputRequiredResult,
+  RequestStateCodec,
+  ServerContext,
 } from '@modelcontextprotocol/server';
 import { z } from 'zod';
 import {
@@ -39,9 +42,19 @@ import type {
   UpdateServiceApplicationRequest,
   UpdateServiceRequest,
   Database,
+  VolumeBackupScheduleRequest,
 } from '../types/coolify.js';
 import { DocsSearchEngine } from './docs-search.js';
-import { confirmDestructive, describeBlastRadius, sanitizeForPrompt } from './elicit.js';
+import {
+  confirmDestructive,
+  confirmDestructiveModern,
+  createConfirmationCodec,
+  supportsElicitation,
+  describeBlastRadius,
+  sanitizeForPrompt,
+  type ConfirmationState,
+} from './elicit.js';
+import { auditEnabled, auditedCall, markRefused } from './audit.js';
 import { DEFAULT_INSTANCE_NAME, InstanceRegistry, type InstanceDefinition } from './instances.js';
 import { buildInstructions } from './instructions.js';
 import {
@@ -218,6 +231,45 @@ function joinList(parts: string[]): string {
  * site. Only an explicit `false` is treated as "volumes kept", which is both
  * what the spec says and the safe way to be wrong if the spec is lying again.
  */
+/**
+ * Confirmation text for `move` (#299).
+ *
+ * Deliberately *not* written in the register of `deleteResourcePrompt`. The
+ * issue asked for "the destructive/blast-radius framing the delete actions
+ * have", but upstream documents the move as "a purely organizational change —
+ * running containers are not affected", and a prompt that threatens destruction
+ * it cannot cause is the same failure as one that understates: both teach people
+ * to stop reading the dialog.
+ *
+ * The real hazard is delayed and easy to miss, so it is the thing the prompt
+ * leads on: from the next deployment the resource inherits the *target*
+ * environment's shared environment variables. Moving production into staging
+ * looks like nothing at all until someone redeploys.
+ *
+ * It also says the move is reversible, because it is — the same call in the
+ * other direction — and a confirmation that implies otherwise costs the reader
+ * a hesitation they do not need to have.
+ */
+function moveResourcePrompt(
+  kind: 'application' | 'database' | 'service',
+  name: string,
+  uuid: string,
+  targetEnvironmentUuid: string,
+  currentEnvironmentUuid?: string,
+): string {
+  const from = currentEnvironmentUuid
+    ? ` It is currently in environment ${sanitizeForPrompt(currentEnvironmentUuid)}.`
+    : '';
+  return (
+    `Move ${kind} "${sanitizeForPrompt(name)}" (${sanitizeForPrompt(uuid)}) ` +
+    `to environment ${sanitizeForPrompt(targetEnvironmentUuid)}?\n\n` +
+    `Containers are not affected and keep running.${from} From its next deployment ` +
+    `onwards it will use the target environment's shared environment variables ` +
+    `instead of its current ones, so check the target is the environment you mean. ` +
+    `The move is reversible: moving it back is the same operation in the other direction.`
+  );
+}
+
 function deleteResourcePrompt(
   kind: 'application' | 'database' | 'service',
   name: string,
@@ -577,6 +629,70 @@ export const TOOL_ANNOTATIONS = {
  */
 export type ToolName = keyof typeof TOOL_ANNOTATIONS;
 
+/**
+ * Human display names, one per tool (#406).
+ *
+ * `title` is the label a client shows a person; `name` is what the model
+ * calls. The MCP spec has carried a top-level `title` since 2025-06-18, and
+ * the Connectors Directory requires one on every submitted tool.
+ *
+ * Typed as `Record<ToolName, string>` rather than `satisfies`, so the compiler
+ * fails on a tool that has no title, the same way {@link TOOL_ANNOTATIONS}
+ * fails on one with no annotations. There is no default to fall back to: a
+ * missing title is a gap in the UI, not a shrug.
+ *
+ * Kept short on purpose. Titles ride `tools/list`, which every session pays
+ * for on connect, and the budget guard in `evals/` counts them.
+ */
+const TOOL_TITLES: Record<ToolName, string> = {
+  application: 'Manage application',
+  application_logs: 'Application logs',
+  bulk_env_update: 'Bulk update env var',
+  cloud_tokens: 'Cloud provider tokens',
+  control: 'Start, stop or restart',
+  database: 'Manage database',
+  database_backups: 'Database backups',
+  deploy: 'Deploy',
+  deployment: 'Manage deployment',
+  diagnose_app: 'Diagnose application',
+  diagnose_server: 'Diagnose server',
+  env_vars: 'Environment variables',
+  environments: 'Manage environments',
+  find_issues: 'Find estate issues',
+  get_application: 'Application details',
+  get_database: 'Database details',
+  get_infrastructure_overview: 'Infrastructure overview',
+  get_mcp_version: 'MCP server version',
+  get_server: 'Server details',
+  get_service: 'Service details',
+  get_version: 'Coolify version',
+  github_apps: 'GitHub Apps',
+  hetzner: 'Hetzner cloud',
+  list_applications: 'List applications',
+  list_databases: 'List databases',
+  list_deployments: 'List deployments',
+  list_destinations: 'List destinations',
+  list_instances: 'List Coolify instances',
+  list_servers: 'List servers',
+  list_services: 'List services',
+  logs: 'Container logs',
+  private_keys: 'SSH private keys',
+  projects: 'Manage projects',
+  redeploy_project: 'Redeploy project',
+  restart_project_apps: 'Restart project apps',
+  scheduled_tasks: 'Scheduled tasks',
+  search_docs: 'Search Coolify docs',
+  server_domains: 'Server domains',
+  server_resources: 'Server resources',
+  service: 'Manage service',
+  stop_all_apps: 'Emergency stop all apps',
+  storages: 'Manage storages',
+  system: 'System and API access',
+  tags: 'Manage tags',
+  teams: 'Teams',
+  validate_server: 'Validate server',
+};
+
 /** Tools that exist only when more than one instance is configured (#367). */
 export const FLEET_ONLY_TOOLS: ReadonlySet<ToolName> = new Set<ToolName>(['list_instances']);
 
@@ -606,6 +722,12 @@ export interface CoolifyMcpServerOptions {
    * HTTP mode sets this; stdio keeps the progressive-enhancement default.
    */
   requireElicitation?: boolean;
+  /**
+   * Default for the audit log (#370) when `COOLIFY_MCP_AUDIT` says nothing.
+   * HTTP mode passes true; stdio leaves it off, because a local single-user
+   * pipe writing a line per call is noise for most people.
+   */
+  auditByDefault?: boolean;
 }
 
 /**
@@ -631,7 +753,21 @@ export class CoolifyMcpServer extends McpServer {
    * follows the call through every await, promise and timer.
    */
   private readonly instanceContext = new AsyncLocalStorage<InstanceDefinition>();
+  /**
+   * The context of the tool call in hand.
+   *
+   * `guardDestructive` needs the era, the echoed `inputResponses` and the
+   * verified `requestState`, and it is reached from 21 handlers that would
+   * otherwise all have to thread a parameter they never look at. Same
+   * async-local mechanism as {@link instanceContext} rather than a field on
+   * `this`, because concurrent tool calls on one server would race on a field.
+   */
+  private readonly callContext = new AsyncLocalStorage<ServerContext>();
+  /** Seals the confirmation state that round-trips through the client (#341). */
+  private readonly requestState: RequestStateCodec<ConfirmationState>;
   private readonly serverOptions: CoolifyMcpServerOptions;
+  /** Resolved once at construction: env overrides the transport's default (#370). */
+  private readonly auditing: boolean;
   /**
    * The tools that actually got registered on this instance. Read-only mode
    * (#303) drops every mutating tool and fleet mode adds one, so "which tools
@@ -711,6 +847,7 @@ export class CoolifyMcpServer extends McpServer {
       try {
         instance = this.registry.get(requested);
       } catch (error) {
+        markRefused('validation');
         return {
           content: [
             {
@@ -722,11 +859,41 @@ export class CoolifyMcpServer extends McpServer {
       }
       return this.instanceContext.run(instance, () => cb(forwarded as typeof args, extra));
     };
+    // Audit wraps the OUTERMOST callback so the line covers instance routing
+    // too: an unknown instance name is a refusal like any other, and a record
+    // that only starts once routing succeeded would be missing exactly the
+    // calls somebody is most likely to be looking for.
+    const audited: ToolCallback<z.ZodObject<Args>> = !this.auditing
+      ? scoped
+      : (args, extra) =>
+          auditedCall(
+            {
+              tool: name,
+              args,
+              instance: this.registry.isFleet
+                ? ((args as { instance?: string }).instance ?? this.registry.default.name)
+                : undefined,
+              // `http.authInfo`, not `authInfo`: the SDK hangs the validated
+              // token off the HTTP sub-context. Read from the wrong path this
+              // is silently always `undefined`, which is how every audit line
+              // this server has written in HTTP mode has been missing its
+              // `client_id` — the field looked implemented and never was.
+              clientId: extra.http?.authInfo?.clientId,
+            },
+            () => scoped(args, extra),
+          ) as ReturnType<ToolCallback<z.ZodObject<Args>>>;
+
+    // Outermost, so everything below it — audit, instance routing, the
+    // handler, and the destructive guard the handler calls — can reach the
+    // context of the call in hand without 21 handlers threading a parameter.
+    const contextual: ToolCallback<z.ZodObject<Args>> = (args, extra) =>
+      this.callContext.run(extra, () => audited(args, extra));
+
     this.registeredTools.add(name);
     this.registerTool(
       name,
-      { description, inputSchema: z.object(shape), annotations },
-      scoped as unknown as ToolCallback<z.ZodObject<typeof shape>>,
+      { title: TOOL_TITLES[name], description, inputSchema: z.object(shape), annotations },
+      contextual as unknown as ToolCallback<z.ZodObject<typeof shape>>,
     );
   }
 
@@ -791,7 +958,7 @@ export class CoolifyMcpServer extends McpServer {
     label: string,
     summarize: () => string | null | Promise<string | null>,
     operation: () => Promise<T>,
-  ): Promise<{ content: Array<{ type: 'text'; text: string }> }> {
+  ): Promise<{ content: Array<{ type: 'text'; text: string }> } | InputRequiredResult> {
     // Fleet mode (#367): every confirmation names the instance. Cross-instance
     // fat-fingering is the failure mode a second instance invents, and the
     // prompt is where it gets caught — "Delete api-server on prod?".
@@ -803,10 +970,44 @@ export class CoolifyMcpServer extends McpServer {
           return summary === null ? null : `Instance: ${instance.name}\n${summary}`;
         }
       : summarize;
+    // Protocol revision 2026-07-28 removed server-initiated requests during a
+    // call, so `elicitInput` throws there and the confirmation has to be a
+    // two-round-trip exchange instead (#341). Both eras are live in the wild —
+    // claude.ai is on the new one, other clients are not — so this branches on
+    // the era of the call in hand rather than on a build-time switch.
+    // How to tell the eras apart from inside a handler: the 2026-07-28 wire
+    // requires a per-request `_meta` envelope on every request, and the
+    // protocol layer lifts it onto `ctx.mcpReq.envelope`. A 2025-era request
+    // has none, and a request that claims the envelope and malforms it is
+    // rejected by the SDK before any handler runs — so presence is a decision,
+    // not a guess.
+    const ctx = this.callContext.getStore();
+    if (ctx?.mcpReq.envelope !== undefined) {
+      const confirmation = await confirmDestructiveModern(
+        ctx,
+        scopedLabel,
+        scopedSummarize,
+        (payload, mintCtx) => this.requestState.mint(payload, mintCtx),
+        // Same gate as the 2025 path, and the same escape hatch: an
+        // internet-facing server that cannot ask must refuse, not proceed.
+        supportsElicitation(this.server),
+      );
+      if (confirmation.status === 'ask') return confirmation.result;
+      if (confirmation.status === 'refused') {
+        markRefused(confirmation.reason);
+        return { content: [{ type: 'text' as const, text: confirmation.message }] };
+      }
+      return wrap(operation);
+    }
+
     const outcome = await confirmDestructive(this.server, scopedLabel, scopedSummarize, signal, {
       requireHuman: this.serverOptions.requireElicitation,
     });
     if (!outcome.approved) {
+      // The branch that knows why says why (#408). This used to read the
+      // category back out of the prose, which classified every timeout and
+      // transport failure as a human decline.
+      markRefused(outcome.reason);
       return { content: [{ type: 'text' as const, text: outcome.message }] };
     }
     return wrap(operation);
@@ -817,6 +1018,13 @@ export class CoolifyMcpServer extends McpServer {
       config instanceof InstanceRegistry
         ? config
         : new InstanceRegistry([{ name: DEFAULT_INSTANCE_NAME, ...config }]);
+    // Built before `super` because the verifier has to be handed to the SDK in
+    // the same options object: the seam runs `verify` on an echoed
+    // `requestState` BEFORE the handler is entered, so a forged or expired one
+    // never reaches a guarded operation at all.
+    const requestState = createConfirmationCodec({
+      announceGeneratedKey: options?.requireElicitation === true,
+    });
     // `instructions` rides `initialize`, not `tools/list`, so shaping it by
     // mode costs the single-instance tool list nothing (#339).
     super(
@@ -828,13 +1036,16 @@ export class CoolifyMcpServer extends McpServer {
           readonly: options?.readonly === true,
           requireElicitation: options?.requireElicitation === true,
         }),
+        requestState: { verify: (state, ctx) => requestState.verify(state, ctx) },
       },
     );
+    this.requestState = requestState;
     this.registry = registry;
     for (const instance of this.registry.all) {
       this.clients.set(instance.name, new CoolifyClient(instance));
     }
     this.serverOptions = options ?? {};
+    this.auditing = auditEnabled(options?.auditByDefault === true);
     this.registerTools();
     // Order matters: prompts describe workflows in terms of the tools that
     // actually registered above, and `definePrompt` reads that set.
@@ -1641,7 +1852,7 @@ export class CoolifyMcpServer extends McpServer {
 
     this.defineTool(
       'application',
-      'Manage app: create/update/delete/delete_preview',
+      'Manage app: create/update/move/delete/delete_preview',
       {
         action: z.enum([
           'create_public',
@@ -1650,6 +1861,7 @@ export class CoolifyMcpServer extends McpServer {
           'create_dockerimage',
           'create_dockerfile',
           'update',
+          'move',
           'delete',
           'delete_preview',
         ]),
@@ -1982,6 +2194,31 @@ export class CoolifyMcpServer extends McpServer {
             const { action: _, uuid: __, delete_volumes: ___, ...updateData } = args;
             return wrap(() => this.client.updateApplication(uuid, updateData));
           }
+          case 'move':
+            if (!uuid || !args.environment_uuid)
+              return {
+                content: [
+                  {
+                    type: 'text' as const,
+                    text: 'Error: uuid, environment_uuid required. Find the target environment_uuid with the `environments` tool.',
+                  },
+                ],
+              };
+            return this.guardDestructive(
+              extra.mcpReq.signal,
+              `Move an application to another environment.`,
+              async () => {
+                const app = await this.client.getApplication(uuid);
+                return moveResourcePrompt(
+                  'application',
+                  app.name || uuid,
+                  uuid,
+                  args.environment_uuid!,
+                  app.environment_uuid,
+                );
+              },
+              () => this.client.moveApplication(uuid, args.environment_uuid!),
+            );
           case 'delete':
             if (!uuid)
               return { content: [{ type: 'text' as const, text: 'Error: uuid required' }] };
@@ -2079,9 +2316,9 @@ export class CoolifyMcpServer extends McpServer {
 
     this.defineTool(
       'database',
-      'Manage database: create/update/delete. `update` is how you expose an existing database on a public port (`is_public` + `public_port`) or change limits/credentials. Credential fields must match the engine (postgres_* on postgresql, and so on); changing any *_user/*_password on update asks for confirmation, since every app holding the old value breaks.',
+      'Manage database: create/update/move/delete. `update` is how you expose an existing database on a public port (`is_public` + `public_port`) or change limits/credentials. Credential fields must match the engine (postgres_* on postgresql, and so on); changing any *_user/*_password on update asks for confirmation, since every app holding the old value breaks.',
       {
-        action: z.enum(['create', 'update', 'delete']),
+        action: z.enum(['create', 'update', 'move', 'delete']),
         type: z
           .enum([
             'postgresql',
@@ -2098,6 +2335,10 @@ export class CoolifyMcpServer extends McpServer {
         server_uuid: z.string().optional(),
         project_uuid: z.string().optional(),
         environment_name: z.string().optional(),
+        environment_uuid: z
+          .string()
+          .optional()
+          .describe('Target environment for `move`; find it with the `environments` tool.'),
         destination_uuid: z
           .string()
           .optional()
@@ -2154,6 +2395,32 @@ export class CoolifyMcpServer extends McpServer {
       },
       async (args, extra) => {
         const { action, type, uuid, delete_volumes, ...dbData } = args;
+        if (action === 'move') {
+          if (!uuid || !args.environment_uuid)
+            return {
+              content: [
+                {
+                  type: 'text' as const,
+                  text: 'Error: uuid, environment_uuid required. Find the target environment_uuid with the `environments` tool.',
+                },
+              ],
+            };
+          return this.guardDestructive(
+            extra.mcpReq.signal,
+            `Move a database to another environment.`,
+            async () => {
+              const db = await this.client.getDatabase(uuid);
+              return moveResourcePrompt(
+                'database',
+                db.name || uuid,
+                uuid,
+                args.environment_uuid!,
+                db.environment_uuid,
+              );
+            },
+            () => this.client.moveDatabase(uuid, args.environment_uuid!),
+          );
+        }
         if (action === 'delete') {
           if (!uuid) return { content: [{ type: 'text' as const, text: 'Error: uuid required' }] };
           return this.guardDestructive(
@@ -2176,6 +2443,7 @@ export class CoolifyMcpServer extends McpServer {
             server_uuid: _server,
             project_uuid: _project,
             environment_name: _env,
+            environment_uuid: _envUuid,
             destination_uuid: _dest,
             instant_deploy: _deploy,
             ...updateData
@@ -2285,11 +2553,12 @@ export class CoolifyMcpServer extends McpServer {
 
     this.defineTool(
       'service',
-      "Manage service: create/update/delete/list_containers/update_application/start_application/stop_application/restart_application. A service is a multi-container stack; `list_containers` returns the applications and databases inside it, whose names are what the `logs` tool needs as `container`. Use `update_application` to change a sub-application's FQDN (url) or other settings. Use `start_application`/`stop_application`/`restart_application` to control sub-application lifecycle. `update` with `connect_to_docker_network` attaches the stack to the shared `coolify` network so other stacks can reach its containers by name.",
+      "Manage service: create/update/move/delete/list_containers/update_application/start_application/stop_application/restart_application. A service is a multi-container stack; `list_containers` returns the applications and databases inside it, whose names are what the `logs` tool needs as `container`. Use `update_application` to change a sub-application's FQDN (url) or other settings. Use `start_application`/`stop_application`/`restart_application` to control sub-application lifecycle. `update` with `connect_to_docker_network` attaches the stack to the shared `coolify` network so other stacks can reach its containers by name.",
       {
         action: z.enum([
           'create',
           'update',
+          'move',
           'delete',
           'list_containers',
           'update_application',
@@ -2308,7 +2577,10 @@ export class CoolifyMcpServer extends McpServer {
         server_uuid: z.string().optional(),
         project_uuid: z.string().optional(),
         environment_name: z.string().optional().describe('Create: this or environment_uuid'),
-        environment_uuid: z.string().optional().describe('Create: this or environment_name'),
+        environment_uuid: z
+          .string()
+          .optional()
+          .describe('Create: this or environment_name. Move: the target environment.'),
         destination_uuid: z
           .string()
           .optional()
@@ -2410,6 +2682,31 @@ export class CoolifyMcpServer extends McpServer {
             }
             return wrap(() => this.client.updateService(uuid, updateData));
           }
+          case 'move':
+            if (!uuid || !args.environment_uuid)
+              return {
+                content: [
+                  {
+                    type: 'text' as const,
+                    text: 'Error: uuid, environment_uuid required. Find the target environment_uuid with the `environments` tool.',
+                  },
+                ],
+              };
+            return this.guardDestructive(
+              extra.mcpReq.signal,
+              `Move a service to another environment.`,
+              async () => {
+                const svc = await this.client.getService(uuid);
+                return moveResourcePrompt(
+                  'service',
+                  svc.name || uuid,
+                  uuid,
+                  args.environment_uuid!,
+                  svc.environment_uuid,
+                );
+              },
+              () => this.client.moveService(uuid, args.environment_uuid!),
+            );
           case 'delete':
             if (!uuid)
               return { content: [{ type: 'text' as const, text: 'Error: uuid required' }] };
@@ -3368,12 +3665,38 @@ export class CoolifyMcpServer extends McpServer {
     // =========================================================================
     this.defineTool(
       'storages',
-      'Manage persistent/file storages for app, database, or service: list/create/update/delete',
+      'Manage persistent/file storages for app, database, or service: list/create/update/delete, ' +
+        'plus volume backups (v4.2+): backup_set/backup_delete/backup_run. backup_set REPLACES ' +
+        'the schedule — omitted fields revert to defaults and there is no read-back endpoint, so ' +
+        'send it whole. backup_delete deletes the archives too.',
       {
         resource: z.enum(['application', 'database', 'service']),
-        action: z.enum(['list', 'create', 'update', 'delete']),
+        action: z.enum([
+          'list',
+          'create',
+          'update',
+          'delete',
+          'backup_set',
+          'backup_delete',
+          'backup_run',
+        ]),
         uuid: z.string(),
         storage_uuid: z.string().optional(),
+        // Volume backup schedule (backup_set only). Names and defaults mirror
+        // VolumeBackupScheduleRequest exactly; see the replace-semantics note there.
+        frequency: z.string().optional().describe('backup_set: cron, e.g. `0 2 * * *`. Required.'),
+        enabled: z.boolean().optional(),
+        save_s3: z.boolean().optional(),
+        disable_local_backup: z.boolean().optional(),
+        stop_during_backup: z.boolean().optional().describe('Downtime: stops the container.'),
+        s3_storage_uuid: z.string().optional(),
+        retention_amount_locally: z.number().optional(),
+        retention_days_locally: z.number().optional(),
+        retention_max_storage_locally: z.number().optional(),
+        retention_amount_s3: z.number().optional(),
+        retention_days_s3: z.number().optional(),
+        retention_max_storage_s3: z.number().optional(),
+        timeout: z.number().optional(),
         type: z.enum(['persistent', 'file']).optional(),
         mount_path: z.string().optional(),
         name: z.string().optional(),
@@ -3383,16 +3706,53 @@ export class CoolifyMcpServer extends McpServer {
         fs_path: z.string().optional(),
         is_preview_suffix_enabled: z.boolean().optional(),
       },
-      async (args) => {
+      async (args, extra) => {
         const { resource, action, uuid, storage_uuid } = args;
         if (action === 'create' && (!args.type || !args.mount_path))
           return { content: [{ type: 'text' as const, text: 'Error: type, mount_path required' }] };
+        if (action.startsWith('backup_') && !storage_uuid)
+          return {
+            content: [
+              {
+                type: 'text' as const,
+                text: 'Error: storage_uuid required. List the storages first to find it.',
+              },
+            ],
+          };
+        if (action === 'backup_set' && !args.frequency)
+          return {
+            content: [
+              {
+                type: 'text' as const,
+                text: 'Error: frequency required (cron, e.g. `0 2 * * *`). backup_set replaces the whole schedule, so send every field you want kept — Coolify has no endpoint to read the current one back.',
+              },
+            ],
+          };
         if (action === 'update' && (!args.type || !storage_uuid))
           return {
             content: [{ type: 'text' as const, text: 'Error: type, storage_uuid required' }],
           };
         if (action === 'delete' && !storage_uuid)
           return { content: [{ type: 'text' as const, text: 'Error: storage_uuid required' }] };
+        // Built once, read by all three resource branches. Undefined fields are
+        // dropped by `cleanRequestData`, so an omitted field takes Coolify's
+        // default rather than being sent as null — which is the replace
+        // behaviour the tool description warns about, made explicit here.
+        const backupSchedule = (): VolumeBackupScheduleRequest => ({
+          frequency: args.frequency!,
+          enabled: args.enabled,
+          save_s3: args.save_s3,
+          disable_local_backup: args.disable_local_backup,
+          stop_during_backup: args.stop_during_backup,
+          s3_storage_uuid: args.s3_storage_uuid,
+          retention_amount_locally: args.retention_amount_locally,
+          retention_days_locally: args.retention_days_locally,
+          retention_max_storage_locally: args.retention_max_storage_locally,
+          retention_amount_s3: args.retention_amount_s3,
+          retention_days_s3: args.retention_days_s3,
+          retention_max_storage_s3: args.retention_max_storage_s3,
+          timeout: args.timeout,
+        });
         const methods: Record<string, Record<string, () => Promise<unknown>>> = {
           application: {
             list: () => this.client.listApplicationStorages(uuid),
@@ -3419,6 +3779,10 @@ export class CoolifyMcpServer extends McpServer {
                 is_preview_suffix_enabled: args.is_preview_suffix_enabled,
               }),
             delete: () => this.client.deleteApplicationStorage(uuid, storage_uuid!),
+            backup_set: () =>
+              this.client.setApplicationStorageBackup(uuid, storage_uuid!, backupSchedule()),
+            backup_delete: () => this.client.deleteApplicationStorageBackup(uuid, storage_uuid!),
+            backup_run: () => this.client.runApplicationStorageBackup(uuid, storage_uuid!),
           },
           database: {
             list: () => this.client.listDatabaseStorages(uuid),
@@ -3445,6 +3809,10 @@ export class CoolifyMcpServer extends McpServer {
                 is_preview_suffix_enabled: args.is_preview_suffix_enabled,
               }),
             delete: () => this.client.deleteDatabaseStorage(uuid, storage_uuid!),
+            backup_set: () =>
+              this.client.setDatabaseStorageBackup(uuid, storage_uuid!, backupSchedule()),
+            backup_delete: () => this.client.deleteDatabaseStorageBackup(uuid, storage_uuid!),
+            backup_run: () => this.client.runDatabaseStorageBackup(uuid, storage_uuid!),
           },
           service: {
             list: () => this.client.listServiceStorages(uuid),
@@ -3471,8 +3839,30 @@ export class CoolifyMcpServer extends McpServer {
                 is_preview_suffix_enabled: args.is_preview_suffix_enabled,
               }),
             delete: () => this.client.deleteServiceStorage(uuid, storage_uuid!),
+            backup_set: () =>
+              this.client.setServiceStorageBackup(uuid, storage_uuid!, backupSchedule()),
+            backup_delete: () => this.client.deleteServiceStorageBackup(uuid, storage_uuid!),
+            backup_run: () => this.client.runServiceStorageBackup(uuid, storage_uuid!),
           },
         };
+        if (action === 'backup_delete') {
+          // The only genuinely destructive action in this tool that takes data
+          // with it. Upstream: "Delete the backup schedule and its local and S3
+          // archives" — so this is not "stop backing up", it is "stop backing up
+          // AND throw away every backup you already have". Those are different
+          // decisions and the prompt has to say which one is happening.
+          return this.guardDestructive(
+            extra.mcpReq.signal,
+            `Delete a volume backup schedule and every archive it has taken.`,
+            () =>
+              `Delete the backup schedule for storage ${sanitizeForPrompt(storage_uuid!)} on ` +
+              `${resource} ${sanitizeForPrompt(uuid)}?\n\n` +
+              `Its local and S3 archives are deleted with it, so existing backups of this volume ` +
+              `are gone and cannot be restored. Stopping future backups without discarding the ` +
+              `archives is \`backup_set\` with \`enabled: false\` instead. This cannot be undone.`,
+            () => methods[resource][action](),
+          );
+        }
         return wrap(() => methods[resource][action]());
       },
     );

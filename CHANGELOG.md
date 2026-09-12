@@ -11,10 +11,75 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Remove the fork-only `verify_app_environment` tool. Upstream landed the same capability in #381 as `environments { action: 'verify_app' }` (carrying commit `a886f064` from #345), and both registrations called the identical `CoolifyClient.verifyApplicationEnvironment`; the standalone tool differed only by projecting `{ identity, name }` instead of the full proof. Callers should use `environments { action: 'verify_app' }` and read `environment.id` / `environment.name`.
 - Retain the strict exact-anchor validation in `CoolifyClient.verifyApplicationEnvironment`, which upstream dropped. It rejects empty or whitespace-padded anchors and any containing `\0 \r \n / ? # % \` before a request is issued, and now guards the upstream `verify_app` action as the sole caller.
+## [3.4.0] - 2026-09-11
+
+### Added
+
+- **Destructive confirmation works on protocol revision `2026-07-28`** (#341). That revision removed server-initiated requests mid-call, so the elicitation prompt this server has always used simply stopped working: every guarded operation on a current claude.ai client aborted with `could not confirm with the user`, and no setting recovered it. Confirmation is now a two round-trip exchange on that era, unchanged on the 2025 era, chosen per call from the request itself. The summary you were shown is digested into signed state that the client echoes back, so an approval only authorises the blast radius it described — an emergency stop confirmed at 12 applications is refused rather than widened if 14 are running by the time you answer. Ten-minute expiry, fails closed, `MCP_REQUEST_STATE_KEY` to survive restarts. Blast-radius summaries now render in a stable order, so a reordering by Coolify cannot read as a changed blast radius and refuse an approval that was legitimately given.
+
+### Fixed
+
+- **The audit log no longer reports a failed confirmation as a human decline** (#408). The refusal category was recovered by matching a substring of the error text, so a timeout, a cancelled call or a client that could not be asked all recorded as `declined`. On the current protocol revision that was every destructive refusal, meaning the log answered "did someone approve this?" wrongly in exactly the case it exists for. The branch that knows why now says so, and `cancelled`, `unavailable` and `stale_confirmation` are distinguishable from a person saying no.
+- **A raised confirmation is no longer audited as a successful destructive call** (#341). On the two round-trip era one guarded operation writes two lines, and the first is a question. It recorded as `ok`, so anything counting successful destructive operations doubled every one. It now records as `awaiting_confirmation`, which is worth counting in its own right.
+- **HTTP audit lines carry the OAuth client id they always claimed to** (#408). It was read from `authInfo` on the handler context when the SDK hangs it off `http.authInfo`, so the field was silently absent from every line this server has ever written in HTTP mode.
+
+### Upgrading from 3.3
+
+- **Fixes a total outage of destructive operations on current clients.** If
+  your client speaks protocol revision `2026-07-28` — claude.ai does today —
+  every guarded operation on the remote server was aborting with `could not
+confirm with the user`, and no setting recovered it. This release is the fix.
+  Nothing changes for clients on the 2025 revisions, including the local stdio
+  server, which was never affected.
+- **Drop-in.** No required configuration. `MCP_REQUEST_STATE_KEY` is optional
+  and only matters if you run more than one replica, or would rather a redeploy
+  did not interrupt someone mid-confirmation.
+- **The audit log gained an outcome.** `awaiting_confirmation` marks the first
+  of the two lines a guarded operation now writes on that revision. Anything
+  counting successful destructive calls should skip it, and anything counting
+  refusals should know that `declined` now means a person actually said no.
+- **Blast-radius summaries are sorted.** The same resources always render in
+  the same order. If you diff these prompts, expect a one-off reshuffle.
+
+## [3.3.0] - 2026-09-11
+
+### Added
+
+- **Move a resource between environments** (#299). `application`, `database` and `service` take a `move` action, taking the target `environment_uuid`. "Promote this app from staging to production" now has an answer that is one call instead of recreating the resource and copying env vars across. Requires Coolify v4.2+; an older instance is told so by name rather than returning a bare 404. The confirmation says what a move actually does: containers keep running, and from the next deployment the resource uses the target environment's shared environment variables.
+- **Scheduled volume backups** (#305). `storages` gains `backup_set`, `backup_delete` and `backup_run` for application, database and service volumes (Coolify v4.2+). `backup_delete` removes the archives as well as the schedule, so it asks first, and points at `backup_set` with `enabled: false` for the "stop backing up but keep what I have" case. Note two upstream limits: Coolify has no endpoint to read a schedule back, so `find_issues` still cannot flag a volume with no backup; and `backup_set` replaces the whole schedule rather than merging, so omitted fields revert to their defaults.
+- **`COOLIFY_ACCESS_TOKEN_FILE`: rotate the Coolify token without restarting** (#398). A stdio server is spawned once per client session and a subprocess never sees a later change to its parent's environment, so rotating `COOLIFY_ACCESS_TOKEN` could not reach a running server. Point the new variable at a file and it is re-read whenever the file changes, taking effect on the next tool call. A `401` triggers exactly one retry, and only when a re-read actually produced a different token, so a rotation landing mid-call recovers while a genuinely bad token still fails on the first attempt. `doctor` reports the source, and for a file its path and age, never the value. Raised by a user who retired this server partly for this reason.
+- **Audit log for every tool call and every refusal** (#370). One JSON line per call carrying the tool, action, resource uuids, outcome, duration, and in HTTP mode the OAuth client id. On by default in HTTP mode, off over stdio, `COOLIFY_MCP_AUDIT` overrides either way. Refusals are distinguished from errors and carry a reason category, so "a human said no" reads differently from "the client could not be asked". Arguments and responses are never logged: identifiers come from a closed allowlist of key names, so a future argument carrying a secret cannot reach a log line without a deliberate edit. See the audit section in `docs/http-mode.md`.
+- **Privacy policy** ([PRIVACY.md](PRIVACY.md)). Written against the code, stating what the server collects (nothing), where the token goes (your Coolify instance and nowhere else), the one other outbound request it makes, and what the audit log does and does not record. Linked from the README and declared in `manifest.json`, both of which the Connectors Directory requires of a local connector.
+- **A display title on every tool** (#406). Tools now carry the spec's top-level `title` alongside `name`, so a client can show a person "Emergency stop" where the model reads `stop_all_apps`. Titles live in a table typed `Record<ToolName, string>`, so a new tool without one is a compile error rather than a blank label. The Connectors Directory requires a title on every submitted tool.
 
 ### Changed
 
+- HTTP mode's audit line now reports what happened rather than what was asked. It previously peeked at the request body before dispatch, which could only name the tool; it is now written after the call completes and carries the outcome and duration.
+- **The Client ID Metadata Document fetch is bounded at 3 seconds** (#340), rather than inheriting the 10 second default. Claude allows 10 seconds for the whole of discovery, registration and token exchange, so one hop cannot be allowed to spend all of it. The `client_id` is a URL the caller chooses, so a host that connects and then stalls is entirely under their control.
+- **The published tool-list token figure is corrected from ~6,600 to ~8,300** (#406). The surface grew through 3.x and the README did not follow, because the budget gate sat ~1,400 tokens above the number the docs advertised and so never tripped. The gate no longer holds a number of its own: it reads the figure out of the README and derives its ceiling from it, bounded in both directions so neither the payload nor the published claim can drift away from the other. Titles account for ~300 of the increase; the rest was already there and unreported.
+
+### Fixed
+
+- **A loopback client can pick its own callback port** (#340). `redirect_uri` was matched by exact string equality, so a native client that registers `http://127.0.0.1/callback` and then calls back on the ephemeral port it actually bound was rejected mid-redirect with a generic `invalid_request`. RFC 8252 requires the port to be free at request time for loopback redirects, and it now is. The relaxation applies only to loopback: a remote https callback differing by port is still a different endpoint and is still refused.
+
 - README answers "why not Coolify's own MCP server?" directly, with a comparison against the built-in `/mcp` and the official CLI, and recommends the built-in outright for single-instance read-only use.
+- Test fixtures, docs examples and one README example prompt now use IANA-reserved `example.com` names instead of live third-party domains, and the blast-radius example reads the same way in the changelog as it does in `docs/security.md`. No behaviour change.
+
+### Upgrading from 3.2
+
+- **Drop-in for stdio users.** No config changes and no new required
+  variables. The tool count is unchanged at 45; three existing tools gained
+  actions rather than new tools appearing.
+- **HTTP mode now writes an audit line per tool call by default.** It is one
+  JSON line on stderr carrying the outcome, and it replaces the older
+  pre-dispatch line that could only name the tool. Anything parsing on the
+  `audit` key still matches, but the timing and the field set changed. Set
+  `COOLIFY_MCP_AUDIT=false` to turn it off.
+- **`move` and the volume backup actions need Coolify v4.2+.** On an older
+  instance they name the version requirement rather than returning a bare 404. Everything else works from v4.0.
+- **Tools now carry a display `title`.** Clients that show one will start
+  showing it; clients that do not are unaffected. This is why the published
+  tool-list figure moved.
 
 ## [3.2.0] - 2026-09-10
 
@@ -208,7 +273,7 @@ No runtime changes. Safe to skip; nothing to upgrade for.
 ### Added
 
 - **Human confirmation for destructive operations** (#261). `stop_all_apps` was gated on a `confirm: true` parameter the _model_ fills in — the model confirming with itself. On clients supporting [elicitation](https://modelcontextprotocol.io/specification/2025-06-18/changelog) the confirmation now happens in client UI, outside the model's control. Covers `stop_all_apps`, `redeploy_project`, `restart_project_apps`, `system disable_api`, the application / database / service / project / environment deletes, and `bulk_env_update` above three apps.
-- Prompts state their blast radius: "take down 12 running applications (api, worker, cockpit and 4 more) across 3 servers?". Delete prompts spell out volume destruction — `delete_volumes` defaults to `true` upstream, so omitting it destroys the data. Project deletes count applications, databases and services. Env var values are never shown.
+- Prompts state their blast radius: "take down 12 running applications (api, worker, dashboard and 4 more) across 3 servers?". Delete prompts spell out volume destruction — `delete_volumes` defaults to `true` upstream, so omitting it destroys the data. Project deletes count applications, databases and services. Env var values are never shown.
 - Progressive enhancement: clients without elicitation (Claude Desktop, claude.ai) behave exactly as before. Once a client advertises support it fails closed — decline, cancel, timeout and transport errors all abort. The tool call's abort signal is threaded through, so a client giving up at 60s cannot leave a prompt live that executes at t=90s.
 - `COOLIFY_MCP_ELICITATION=off` escape hatch, for a client that advertises elicitation but does not implement it.
 - Tool count unchanged at 44.
@@ -313,7 +378,7 @@ No runtime changes. Safe to skip; nothing to upgrade for.
 
 ### Added
 
-- **`custom_network_aliases` on `application` update** (#254) — gives an app container a stable DNS name for app-to-app traffic on a shared network. App containers get `<uuid>-<deploy-suffix>` container names that change every deploy (only databases get a uuid hostname), so this field is the only way to wire e.g. `ASR_URL=http://edator-asr:9000` between apps. Added to `UpdateApplicationRequest` and the `application` tool schema (update only — Coolify's create endpoints don't accept it).
+- **`custom_network_aliases` on `application` update** (#254) — gives an app container a stable DNS name for app-to-app traffic on a shared network. App containers get `<uuid>-<deploy-suffix>` container names that change every deploy (only databases get a uuid hostname), so this field is the only way to wire e.g. `ASR_URL=http://media-asr:9000` between apps. Added to `UpdateApplicationRequest` and the `application` tool schema (update only — Coolify's create endpoints don't accept it).
 - **MCPB bundle for one-click Claude Desktop install** — every release now attaches `coolify-mcp.mcpb` to the GitHub release; drag it into Claude Desktop Settings → Extensions and enter your Coolify URL + token. Built from `manifest.json` via `@anthropic-ai/mcpb` in the publish workflow. No Node install or JSON config editing needed.
 - **Automated MCP Registry publishing** — the publish workflow now pushes `server.json` to registry.modelcontextprotocol.io via `mcp-publisher` (GitHub OIDC) on every release, so the registry listing can no longer go stale.
 

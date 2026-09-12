@@ -2241,11 +2241,11 @@ describe('CoolifyClient', () => {
       mockFetch.mockResolvedValueOnce(mockResponse(mockApplication));
 
       await client.updateApplication('app-uuid', {
-        custom_network_aliases: 'edator-asr',
+        custom_network_aliases: 'media-asr',
       });
 
       const callBody = JSON.parse(mockFetch.mock.calls[0][1]?.body as string);
-      expect(callBody.custom_network_aliases).toBe('edator-asr');
+      expect(callBody.custom_network_aliases).toBe('media-asr');
     });
 
     it('should pass destination_uuid through in createApplicationPublic', async () => {
@@ -4143,9 +4143,9 @@ describe('CoolifyClient', () => {
         {
           id: 1,
           uuid: 'app-uuid-1',
-          name: 'tidylinker',
+          name: 'shop-frontend',
           status: 'running',
-          fqdn: 'https://tidylinker.com',
+          fqdn: 'https://shop.example.com',
           created_at: '2024-01-01',
           updated_at: '2024-01-01',
         },
@@ -4170,7 +4170,7 @@ describe('CoolifyClient', () => {
       it('should find application by name', async () => {
         mockFetch.mockResolvedValueOnce(mockResponse(mockApps));
 
-        const result = await client.resolveApplicationUuid('tidylinker');
+        const result = await client.resolveApplicationUuid('shop-frontend');
 
         expect(result).toBe('app-uuid-1');
       });
@@ -4178,7 +4178,7 @@ describe('CoolifyClient', () => {
       it('should find application by partial name (case-insensitive)', async () => {
         mockFetch.mockResolvedValueOnce(mockResponse(mockApps));
 
-        const result = await client.resolveApplicationUuid('TidyLink');
+        const result = await client.resolveApplicationUuid('Shop-Front');
 
         expect(result).toBe('app-uuid-1');
       });
@@ -4186,7 +4186,7 @@ describe('CoolifyClient', () => {
       it('should find application by domain', async () => {
         mockFetch.mockResolvedValueOnce(mockResponse(mockApps));
 
-        const result = await client.resolveApplicationUuid('tidylinker.com');
+        const result = await client.resolveApplicationUuid('shop.example.com');
 
         expect(result).toBe('app-uuid-1');
       });
@@ -4244,13 +4244,13 @@ describe('CoolifyClient', () => {
             ...mockApps[0],
             uuid: 'app-multi',
             // Trailing comma leaves an empty entry, which must never match.
-            fqdn: 'https://tidylinker.com,https://www.tidylinker.com,',
+            fqdn: 'https://shop.example.com,https://www.shop.example.com,',
           },
-          { ...mockApps[1], uuid: 'app-other', fqdn: 'https://www.tidylinker.com.mirror.dev' },
+          { ...mockApps[1], uuid: 'app-other', fqdn: 'https://www.shop.example.com.mirror.dev' },
         ];
         mockFetch.mockResolvedValueOnce(mockResponse(apps));
 
-        const result = await client.resolveApplicationUuid('www.tidylinker.com');
+        const result = await client.resolveApplicationUuid('www.shop.example.com');
 
         expect(result).toBe('app-multi');
       });
@@ -4671,7 +4671,7 @@ describe('CoolifyClient', () => {
       });
 
       it('should find application by domain and diagnose it', async () => {
-        const mockApps = [{ ...mockApp, uuid: 'found-uuid', fqdn: 'https://tidylinker.com' }];
+        const mockApps = [{ ...mockApp, uuid: 'found-uuid', fqdn: 'https://shop.example.com' }];
         mockFetch
           .mockResolvedValueOnce(mockResponse(mockApps)) // listApplications for lookup
           .mockResolvedValueOnce(mockResponse(mockApp))
@@ -4679,7 +4679,7 @@ describe('CoolifyClient', () => {
           .mockResolvedValueOnce(mockResponse(mockEnvVars))
           .mockResolvedValueOnce(mockResponse(mockDeployments));
 
-        const result = await client.diagnoseApplication('tidylinker.com');
+        const result = await client.diagnoseApplication('shop.example.com');
 
         expect(result.application).not.toBeNull();
       });
@@ -7085,5 +7085,190 @@ describe('errorHint', () => {
     expect(errorHint(200, '/servers')).toBeUndefined();
     expect(errorHint(422, '/applications/app-uuid')).toBeUndefined();
     expect(errorHint(404, '/health')).toBeUndefined();
+  });
+});
+
+describe('move between environments (#299)', () => {
+  let client: CoolifyClient;
+
+  beforeEach(() => {
+    mockFetch.mockClear();
+    global.fetch = mockFetch;
+    client = new CoolifyClient({
+      baseUrl: 'http://localhost:3000',
+      accessToken: 'test-api-key',
+    });
+  });
+
+  // One table because the three endpoints are byte-identical upstream and all
+  // three route through the same private helper. A per-type copy of this test
+  // would pass while the helper built the wrong path for two of them.
+  it.each([
+    ['moveApplication' as const, 'applications'],
+    ['moveDatabase' as const, 'databases'],
+    ['moveService' as const, 'services'],
+  ])('%s posts environment_uuid to /%s/{uuid}/move', async (method, collection) => {
+    mockFetch.mockResolvedValueOnce(mockResponse({ message: 'Moved successfully.' }));
+
+    await client[method]('res-uuid', 'target-env-uuid');
+
+    expect(mockFetch).toHaveBeenCalledWith(
+      `http://localhost:3000/api/v1/${collection}/res-uuid/move`,
+      expect.objectContaining({
+        method: 'POST',
+        body: JSON.stringify({ environment_uuid: 'target-env-uuid' }),
+      }),
+    );
+  });
+
+  it('never retries with GET when the route is absent', async () => {
+    // `/move` has no pre-4.2 GET form, so the legacy fallback must not engage.
+    // A retry here could only hit the same missing route, and on an instance
+    // that DID route it, a second call would be a second move.
+    mockFetch.mockResolvedValueOnce(
+      mockResponse({ message: 'Not found.', docs: 'https://coolify.io/docs/api' }, false, 404),
+    );
+
+    await expect(client.moveApplication('res-uuid', 'target-env-uuid')).rejects.toThrow();
+
+    expect(mockFetch).toHaveBeenCalledTimes(1);
+    expect(mockFetch).toHaveBeenCalledWith(
+      expect.any(String),
+      expect.objectContaining({ method: 'POST' }),
+    );
+  });
+
+  it('surfaces the version hint on the catch-all 404 an older instance returns', async () => {
+    mockFetch.mockResolvedValueOnce(
+      mockResponse({ message: 'Not found.', docs: 'https://coolify.io/docs/api' }, false, 404),
+    );
+
+    await expect(client.moveApplication('res-uuid', 'target-env-uuid')).rejects.toThrow(
+      /Coolify v4\.2\+/,
+    );
+  });
+});
+
+describe('volume backup schedules (#305)', () => {
+  let client: CoolifyClient;
+
+  beforeEach(() => {
+    mockFetch.mockClear();
+    global.fetch = mockFetch;
+    client = new CoolifyClient({
+      baseUrl: 'http://localhost:3000',
+      accessToken: 'test-api-key',
+    });
+  });
+
+  it.each([
+    ['setApplicationStorageBackup' as const, 'applications'],
+    ['setDatabaseStorageBackup' as const, 'databases'],
+    ['setServiceStorageBackup' as const, 'services'],
+  ])('%s PUTs the schedule to /%s/{uuid}/storages/{storage}/backups', async (m, collection) => {
+    mockFetch.mockResolvedValueOnce(mockResponse({ uuid: 'b1', message: 'ok' }));
+
+    await client[m]('res-1', 'stor-1', { frequency: '0 2 * * *' });
+
+    expect(mockFetch).toHaveBeenCalledWith(
+      `http://localhost:3000/api/v1/${collection}/res-1/storages/stor-1/backups`,
+      expect.objectContaining({ method: 'PUT' }),
+    );
+  });
+
+  it.each([
+    ['deleteApplicationStorageBackup' as const, 'applications'],
+    ['deleteDatabaseStorageBackup' as const, 'databases'],
+    ['deleteServiceStorageBackup' as const, 'services'],
+  ])('%s DELETEs /%s/{uuid}/storages/{storage}/backups', async (m, collection) => {
+    mockFetch.mockResolvedValueOnce(mockResponse({ message: 'deleted' }));
+
+    await client[m]('res-1', 'stor-1');
+
+    expect(mockFetch).toHaveBeenCalledWith(
+      `http://localhost:3000/api/v1/${collection}/res-1/storages/stor-1/backups`,
+      expect.objectContaining({ method: 'DELETE' }),
+    );
+  });
+
+  it.each([
+    ['runApplicationStorageBackup' as const, 'applications'],
+    ['runDatabaseStorageBackup' as const, 'databases'],
+    ['runServiceStorageBackup' as const, 'services'],
+  ])('%s POSTs /%s/{uuid}/storages/{storage}/backups/run', async (m, collection) => {
+    mockFetch.mockResolvedValueOnce(mockResponse({ message: 'queued' }));
+
+    await client[m]('res-1', 'stor-1');
+
+    expect(mockFetch).toHaveBeenCalledWith(
+      `http://localhost:3000/api/v1/${collection}/res-1/storages/stor-1/backups/run`,
+      expect.objectContaining({ method: 'POST' }),
+    );
+  });
+
+  it('sends false and zero rather than dropping them', async () => {
+    // The upstream schema defaults `enabled` to true and the retention numbers
+    // to non-zero, so a request builder that strips falsy values would silently
+    // turn "disabled, keep nothing locally" into "enabled, keep 7". Only
+    // `undefined` may be dropped.
+    mockFetch.mockResolvedValueOnce(mockResponse({ uuid: 'b1', message: 'ok' }));
+
+    await client.setApplicationStorageBackup('res-1', 'stor-1', {
+      frequency: '0 2 * * *',
+      enabled: false,
+      save_s3: false,
+      retention_amount_locally: 0,
+      s3_storage_uuid: null,
+    });
+
+    const body = JSON.parse((mockFetch.mock.calls[0][1] as { body: string }).body) as Record<
+      string,
+      unknown
+    >;
+    expect(body).toEqual({
+      frequency: '0 2 * * *',
+      enabled: false,
+      save_s3: false,
+      retention_amount_locally: 0,
+      s3_storage_uuid: null,
+    });
+  });
+
+  it('omits unset fields entirely rather than sending null for them', async () => {
+    // Omission means "take Coolify's default"; an explicit null would mean
+    // something different on `s3_storage_uuid`, the one nullable field.
+    mockFetch.mockResolvedValueOnce(mockResponse({ uuid: 'b1', message: 'ok' }));
+
+    await client.setApplicationStorageBackup('res-1', 'stor-1', { frequency: '@daily' });
+
+    const body = JSON.parse((mockFetch.mock.calls[0][1] as { body: string }).body) as object;
+    expect(body).toEqual({ frequency: '@daily' });
+  });
+});
+
+describe('volume backups on a pre-4.2 instance (#305)', () => {
+  it.each([
+    '/applications/app-1/storages/stor-1/backups',
+    '/databases/db-1/storages/stor-1/backups',
+    '/services/svc-1/storages/stor-1/backups/run',
+  ])('names the version requirement for %s', (path) => {
+    // Found by an end-to-end smoke test against a backend behaving like 4.1.2:
+    // without this the generic uuid-mismatch hint fired and told the user their
+    // uuid was the wrong resource type, sending them after a problem that does
+    // not exist. Same failure `/move` had.
+    expect(errorHint(404, path)).toMatch(/v4\.2\+/);
+  });
+
+  it('does NOT claim v4.2 for the long-standing database dump schedules', () => {
+    // `/databases/{uuid}/backups` is `database_backups`, which works on 4.0.
+    // The `/storages/` segment is the whole difference.
+    const hint = errorHint(404, '/databases/db-1/backups');
+    expect(hint ?? '').not.toMatch(/Volume backup schedules require/);
+  });
+
+  it('mentions database_backups so the two are not confused', () => {
+    expect(errorHint(404, '/applications/app-1/storages/stor-1/backups')).toContain(
+      'database_backups',
+    );
   });
 });

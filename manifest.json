@@ -2,7 +2,7 @@
   "manifest_version": "0.2",
   "name": "coolify-mcp",
   "display_name": "Coolify MCP",
-  "version": "3.2.0",
+  "version": "3.4.0",
   "description": "45 optimized tools for managing Coolify infrastructure, diagnostics, and docs search",
   "author": {
     "name": "Stuart Mason",
@@ -11,6 +11,7 @@
   "homepage": "https://stumason.dev",
   "documentation": "https://github.com/StuMason/coolify-mcp#readme",
   "support": "https://github.com/StuMason/coolify-mcp/issues",
+  "privacy_policies": ["https://github.com/StuMason/coolify-mcp/blob/main/PRIVACY.md"],
   "repository": {
     "type": "git",
     "url": "https://github.com/StuMason/coolify-mcp"

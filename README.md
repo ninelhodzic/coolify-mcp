@@ -71,7 +71,7 @@ Every tool takes an `action`; run one with no arguments and it lists what it acc
 - **Move across the whole estate.** `bulk_env_update`, `redeploy_project`, `stop_all_apps`, each behind a human confirmation that states the blast radius.
 - **Search the Coolify docs** with `search_docs`.
 
-Lists return `uuid`/`name`/`status` summaries, 90–99% smaller than the raw API; `get_*` tools fetch one resource in full. The whole tool list costs about 6,600 tokens of context.
+Lists return `uuid`/`name`/`status` summaries, 90–99% smaller than the raw API; `get_*` tools fetch one resource in full. The whole tool list costs about 8,300 tokens of context.
 
 ## Workflows, not just tools
 
@@ -113,7 +113,7 @@ Other third-party Coolify MCP servers exist. Choose on transport, on how many in
 
 ```text
 Give me an overview of my infrastructure
-Diagnose my stuartmason.co.uk app
+Diagnose my shop.example.com app
 Find any issues in my infrastructure
 Deploy application {uuid} and wait for it to finish
 Update the DATABASE_URL env var for application {uuid}
@@ -144,6 +144,22 @@ I'm Stu Mason. I build MCP servers, AI integrations and agentic systems for agen
 White-label under your own name if you're an agency. And if a job doesn't need AI, I'll say so before anyone's paid for anything.
 
 📮 [hey@stumason.dev](mailto:hey@stumason.dev) · [stumason.dev](https://stumason.dev) · [coolify-mcp.stumason.dev](https://coolify-mcp.stumason.dev/#hire)
+
+## Privacy Policy
+
+This server collects nothing about you. There is no telemetry, no analytics and
+no phone-home, and there is no hosted service behind it.
+
+Your Coolify API token goes to the instance you configured and nowhere else. The
+only other outbound requests are a one-off documentation index refresh from
+`coolify.io`, which carries a cache validator and no credentials, and in HTTP
+mode a credential-free fetch of the connecting client's own metadata document.
+Tool results go to your own MCP client, whose privacy policy governs what
+happens next. The audit log writes to your own stderr and never contains token
+values.
+
+Full detail, including where in the code each claim is implemented, is in
+[PRIVACY.md](PRIVACY.md).
 
 ## Links
 
