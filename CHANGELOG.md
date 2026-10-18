@@ -14,7 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **`deploy` with `wait: true` no longer echoes an unobservable trigger as if it succeeded.** When Coolify returns no `deployment_uuid` (the normal case for a service start), the response is now `status: "not_observable"` with the resource uuids, bounded trigger messages, a reason and a next action (verify containers via `service` `list_containers` / `get_service`), plus `get_service` `_actions` — instead of Coolify's raw "queued" message. `wait: false` is unchanged.
+- **`deploy` with `wait: true` no longer echoes an unobservable trigger as if it succeeded.** When Coolify returns no `deployment_uuid` (the normal case for a service start), the response is now `status: "not_observable"` with the resource uuids, bounded trigger messages, a reason and a next action to verify the resource through its matching `get_*` tool, plus `_actions` classified per entry from Coolify's message (`Service …` → `get_service`, `Database …` → `get_database`, anything else → none) — instead of Coolify's raw "queued" message. `wait: false` is unchanged.
 
 ## [3.4.0] - 2026-09-11
 

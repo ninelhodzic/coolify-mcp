@@ -2075,7 +2075,7 @@ describe('CoolifyMcpServer v2', () => {
         'Service my-svc started. It could take a while, be patient.',
       ]);
       expect(parsed.data.reason).toContain('not a success signal');
-      expect(parsed.data.next_action).toContain('list_containers');
+      expect(parsed.data.next_action).toContain('get_service');
       expect(Object.keys(parsed.data).sort()).toEqual([
         'next_action',
         'reason',
@@ -2105,6 +2105,46 @@ describe('CoolifyMcpServer v2', () => {
       expect(parsed.data.status).toBe('not_observable');
       expect(parsed.data.resource_uuids).toEqual([]);
       expect(parsed.data.trigger_messages).toEqual(['x'.repeat(200)]);
+      expect(parsed._actions).toBeUndefined();
+    });
+
+    // 1dec-R18 review fix — a database deploy also lands on the no-deployment
+    // branch; pointing get_service at its uuid would 404 and read as
+    // "resource not found".
+    it('wait: true suggests get_database, not get_service, for a database trigger', async () => {
+      jest.spyOn(server['client'], 'deployByTagOrUuid').mockResolvedValue({
+        deployments: [{ message: 'Database db started.', resource_uuid: 'db-uuid' }],
+      });
+      const getDeploymentSpy = jest.spyOn(server['client'], 'getDeployment');
+
+      const result = (await callDeploy(server, { tag_or_uuid: 'db-uuid', wait: true })) as {
+        content: Array<{ text: string }>;
+      };
+      const parsed = JSON.parse(result.content[0].text);
+
+      expect(getDeploymentSpy).not.toHaveBeenCalled();
+      expect(parsed.data.status).toBe('not_observable');
+      expect(parsed.data.resource_uuids).toEqual(['db-uuid']);
+      expect(parsed._actions).not.toContainEqual(
+        expect.objectContaining({ tool: 'get_service', args: { uuid: 'db-uuid' } }),
+      );
+      expect(parsed._actions).toEqual([
+        { tool: 'get_database', args: { uuid: 'db-uuid' }, hint: 'Verify container started' },
+      ]);
+    });
+
+    it('wait: true suggests no tool-specific action for an unrecognised trigger message', async () => {
+      jest.spyOn(server['client'], 'deployByTagOrUuid').mockResolvedValue({
+        deployments: [{ message: 'Deployment queue is full.', resource_uuid: 'app-uuid' }],
+      });
+
+      const result = (await callDeploy(server, { tag_or_uuid: 'app-uuid', wait: true })) as {
+        content: Array<{ text: string }>;
+      };
+      const parsed = JSON.parse(result.content[0].text);
+
+      expect(parsed.data.status).toBe('not_observable');
+      expect(parsed.data.resource_uuids).toEqual(['app-uuid']);
       expect(parsed._actions).toBeUndefined();
     });
   });

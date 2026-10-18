@@ -530,11 +530,37 @@ interface DeployNotObservableResult {
   trigger_messages: string[];
   reason: string;
   next_action: string;
+  /**
+   * Follow-up actions, classified per trigger entry. Symbol-keyed so
+   * `JSON.stringify` leaves it out of the response body — it reaches the model
+   * only as `_actions`.
+   */
+  [NOT_OBSERVABLE_FOLLOW_UPS]: ResponseAction[];
 }
 
 /** Caps on how much of the trigger response's free text reaches the model. */
 const MAX_TRIGGER_MESSAGES = 10;
 const MAX_TRIGGER_MESSAGE_CHARS = 200;
+
+const NOT_OBSERVABLE_FOLLOW_UPS: unique symbol = Symbol('notObservableFollowUps');
+
+/**
+ * Which get_* tool can observe a trigger entry's resource. The no-deployment
+ * branch is not service-only: Coolify's `deploy` answers "Service <name>
+ * started." for a service and "Database <name> started." for a database, both
+ * without a deployment_uuid, and an application entry can land here too (e.g.
+ * queue full). Pointing get_service at a database uuid 404s and reads as
+ * "resource not found", so anything unrecognised gets no tool-specific action.
+ */
+function observeActionFor(message: string | undefined, uuid: string): ResponseAction | undefined {
+  if (message?.startsWith('Service ')) {
+    return { tool: 'get_service', args: { uuid }, hint: 'Verify containers started' };
+  }
+  if (message?.startsWith('Database ')) {
+    return { tool: 'get_database', args: { uuid }, hint: 'Verify container started' };
+  }
+  return undefined;
+}
 
 function notObservableDeploy(triggered: DeployTriggerResponse): DeployNotObservableResult {
   const deployments = triggered.deployments ?? [];
@@ -545,6 +571,10 @@ function notObservableDeploy(triggered: DeployTriggerResponse): DeployNotObserva
     .filter((m): m is string => typeof m === 'string' && m.length > 0)
     .slice(0, MAX_TRIGGER_MESSAGES)
     .map((m) => m.slice(0, MAX_TRIGGER_MESSAGE_CHARS));
+  const followUps = deployments
+    .filter((d) => typeof d.resource_uuid === 'string' && d.resource_uuid.length > 0)
+    .map((d) => observeActionFor(d.message, d.resource_uuid as string))
+    .filter((a): a is ResponseAction => a !== undefined);
   return {
     status: 'not_observable',
     waited: false,
@@ -553,7 +583,8 @@ function notObservableDeploy(triggered: DeployTriggerResponse): DeployNotObserva
     reason:
       'Coolify queued the start but returned no deployment_uuid, so its outcome (image pull, container start) is not visible through the API; this is not a success signal.',
     next_action:
-      'Verify by observation: `service` (action: "list_containers") or `get_service` for each resource_uuid — check each container\'s image ref and start time — or the resource\'s own status.',
+      "Verify by observation: for each resource_uuid, check the resource's containers and status through the get_* tool matching its type (e.g. get_service, get_database) — each container's image ref and start time. The trigger message is not a success signal.",
+    [NOT_OBSERVABLE_FOLLOW_UPS]: followUps,
   };
 }
 
@@ -3175,11 +3206,7 @@ export class CoolifyMcpServer extends McpServer {
           (result) =>
             'deployment_uuid' in result
               ? getDeploymentActions(result.deployment_uuid, result.status, result.application_uuid)
-              : result.resource_uuids.map((uuid) => ({
-                  tool: 'get_service',
-                  args: { uuid },
-                  hint: 'Verify containers started',
-                })),
+              : result[NOT_OBSERVABLE_FOLLOW_UPS],
         );
       },
     );
