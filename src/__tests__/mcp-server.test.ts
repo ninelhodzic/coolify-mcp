@@ -2044,6 +2044,69 @@ describe('CoolifyMcpServer v2', () => {
       expect(parsed.data.deployment_uuid).toBe('dep-1');
       expect(parsed.data.additional_deployment_uuids).toEqual(['dep-2']);
     });
+
+    // 1dec-R18 — a service start has no deployment_uuid to poll. Echoing
+    // Coolify's "queued" trigger response read as success while the start
+    // itself failed (image pull unauthorized), so wait must say it could not
+    // observe the outcome.
+    it('wait: true reports not_observable when the trigger has no deployment_uuid', async () => {
+      jest.spyOn(server['client'], 'deployByTagOrUuid').mockResolvedValue({
+        deployments: [
+          {
+            message: 'Service my-svc started. It could take a while, be patient.',
+            resource_uuid: 'svc-uuid',
+            // Would only appear on a raw upstream object — must not leak.
+            server: { private_key: 'super-secret' },
+          } as never,
+        ],
+      });
+      const getDeploymentSpy = jest.spyOn(server['client'], 'getDeployment');
+
+      const result = (await callDeploy(server, { tag_or_uuid: 'svc-uuid', wait: true })) as {
+        content: Array<{ text: string }>;
+      };
+      const parsed = JSON.parse(result.content[0].text);
+
+      expect(getDeploymentSpy).not.toHaveBeenCalled();
+      expect(parsed.data.status).toBe('not_observable');
+      expect(parsed.data.waited).toBe(false);
+      expect(parsed.data.resource_uuids).toEqual(['svc-uuid']);
+      expect(parsed.data.trigger_messages).toEqual([
+        'Service my-svc started. It could take a while, be patient.',
+      ]);
+      expect(parsed.data.reason).toContain('not a success signal');
+      expect(parsed.data.next_action).toContain('list_containers');
+      expect(Object.keys(parsed.data).sort()).toEqual([
+        'next_action',
+        'reason',
+        'resource_uuids',
+        'status',
+        'trigger_messages',
+        'waited',
+      ]);
+      expect(result.content[0].text).not.toContain('private_key');
+      expect(parsed._actions).toEqual([
+        { tool: 'get_service', args: { uuid: 'svc-uuid' }, hint: 'Verify containers started' },
+      ]);
+    });
+
+    it('wait: true reports not_observable when the trigger has no deployments at all', async () => {
+      jest
+        .spyOn(server['client'], 'deployByTagOrUuid')
+        .mockResolvedValue({ message: 'x'.repeat(500) });
+      const getDeploymentSpy = jest.spyOn(server['client'], 'getDeployment');
+
+      const result = (await callDeploy(server, { tag_or_uuid: 'my-tag', wait: true })) as {
+        content: Array<{ text: string }>;
+      };
+      const parsed = JSON.parse(result.content[0].text);
+
+      expect(getDeploymentSpy).not.toHaveBeenCalled();
+      expect(parsed.data.status).toBe('not_observable');
+      expect(parsed.data.resource_uuids).toEqual([]);
+      expect(parsed.data.trigger_messages).toEqual(['x'.repeat(200)]);
+      expect(parsed._actions).toBeUndefined();
+    });
   });
 });
 

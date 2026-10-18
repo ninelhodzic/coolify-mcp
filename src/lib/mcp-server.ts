@@ -515,6 +515,49 @@ interface DeployWaitResult {
 }
 
 /**
+ * What `deploy` with `wait: true` returns when the trigger response carries no
+ * `deployment_uuid` to poll. That is the normal case for a service: Coolify
+ * runs StartService as a background activity, not an application deployment,
+ * and only answers "queued". Echoing that answer read as success while the
+ * start itself could still fail (image pull, container start), so the wait
+ * path says explicitly that the outcome is not visible. Built from the trigger
+ * response's uuids and bounded message strings only — never the raw object.
+ */
+interface DeployNotObservableResult {
+  status: 'not_observable';
+  waited: false;
+  resource_uuids: string[];
+  trigger_messages: string[];
+  reason: string;
+  next_action: string;
+}
+
+/** Caps on how much of the trigger response's free text reaches the model. */
+const MAX_TRIGGER_MESSAGES = 10;
+const MAX_TRIGGER_MESSAGE_CHARS = 200;
+
+function notObservableDeploy(triggered: DeployTriggerResponse): DeployNotObservableResult {
+  const deployments = triggered.deployments ?? [];
+  const resourceUuids = deployments
+    .map((d) => d.resource_uuid)
+    .filter((u): u is string => typeof u === 'string' && u.length > 0);
+  const triggerMessages = [triggered.message, ...deployments.map((d) => d.message)]
+    .filter((m): m is string => typeof m === 'string' && m.length > 0)
+    .slice(0, MAX_TRIGGER_MESSAGES)
+    .map((m) => m.slice(0, MAX_TRIGGER_MESSAGE_CHARS));
+  return {
+    status: 'not_observable',
+    waited: false,
+    resource_uuids: resourceUuids,
+    trigger_messages: triggerMessages,
+    reason:
+      'Coolify queued the start but returned no deployment_uuid, so its outcome (image pull, container start) is not visible through the API; this is not a success signal.',
+    next_action:
+      'Verify by observation: `service` (action: "list_containers") or `get_service` for each resource_uuid — check each container\'s image ref and start time — or the resource\'s own status.',
+  };
+}
+
+/**
  * Tool annotations, spec-stable since 2025-03-26 and honoured by SDK 1.x
  * `registerTool`. They ride the existing `tools/list` response but are NOT
  * free: ~415 tokens as emitted here, and ~751 with the spec defaults spelled
@@ -1134,13 +1177,14 @@ export class CoolifyMcpServer extends McpServer {
     tagOrUuid: string,
     force: boolean | undefined,
     timeoutSeconds: number,
-  ): Promise<DeployWaitResult | DeployTriggerResponse> {
+  ): Promise<DeployWaitResult | DeployNotObservableResult> {
     const triggered = await this.client.deployByTagOrUuid(tagOrUuid, force);
     const [first, ...rest] = triggered.deployments ?? [];
 
     if (!first?.deployment_uuid) {
-      // Nothing to poll against — hand back the trigger response as-is.
-      return triggered;
+      // Nothing to poll against (a service start, typically) — say so rather
+      // than echoing Coolify's "queued" message, which reads as success.
+      return notObservableDeploy(triggered);
     }
 
     const result = await this.pollDeployment(first.deployment_uuid, timeoutSeconds);
@@ -3131,7 +3175,11 @@ export class CoolifyMcpServer extends McpServer {
           (result) =>
             'deployment_uuid' in result
               ? getDeploymentActions(result.deployment_uuid, result.status, result.application_uuid)
-              : [],
+              : result.resource_uuids.map((uuid) => ({
+                  tool: 'get_service',
+                  args: { uuid },
+                  hint: 'Verify containers started',
+                })),
         );
       },
     );
