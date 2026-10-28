@@ -387,6 +387,19 @@ export interface ApplicationEnvironmentVerification {
   environment: { id: number; uuid: string; name: string };
 }
 
+/**
+ * One per-service domain mapping for a `dockercompose` application. Coolify
+ * validates each item as `array:name,domain,redirect` and refuses plain
+ * `domains` for that build pack. Sent as JSON unchanged, never stringified.
+ */
+export interface DockerComposeDomain {
+  /** Compose service name, exactly as in the compose file. */
+  name: string;
+  /** Comma-separated URLs for that service. */
+  domain: string;
+  redirect?: 'www' | 'non-www' | 'both';
+}
+
 export interface CreateApplicationPublicRequest {
   project_uuid: string;
   server_uuid: string;
@@ -397,6 +410,11 @@ export interface CreateApplicationPublicRequest {
   description?: string;
   fqdn?: string;
   domains?: string;
+  // Docker Compose (build_pack: 'dockercompose') fields
+  docker_compose_location?: string;
+  docker_compose_custom_start_command?: string;
+  docker_compose_custom_build_command?: string;
+  docker_compose_domains?: DockerComposeDomain[];
   git_repository: string;
   git_branch: string;
   git_commit_sha?: string;
@@ -538,6 +556,9 @@ export interface UpdateApplicationRequest {
   docker_registry_image_tag?: string;
   docker_compose_raw?: string;
   docker_compose_location?: string;
+  docker_compose_custom_start_command?: string;
+  docker_compose_custom_build_command?: string;
+  docker_compose_domains?: DockerComposeDomain[];
   base_directory?: string;
   publish_directory?: string;
   install_command?: string;

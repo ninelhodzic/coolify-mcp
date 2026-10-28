@@ -2002,6 +2002,23 @@ export class CoolifyMcpServer extends McpServer {
         // Update-only: Coolify strips dockerfile_target_build on every create endpoint
         // (controller $allowedFields line 1014) but accepts on PATCH (line 2497).
         dockerfile_target_build: z.string().optional(),
+        // Docker Compose fields (create_public/github/key + update)
+        docker_compose_location: z
+          .string()
+          .optional()
+          .describe('dockercompose only: compose file path in the repo.'),
+        docker_compose_custom_start_command: z.string().optional().describe('dockercompose only.'),
+        docker_compose_custom_build_command: z.string().optional().describe('dockercompose only.'),
+        docker_compose_domains: z
+          .array(
+            z.strictObject({
+              name: z.string().describe('Compose service name.'),
+              domain: z.string().describe('Comma-separated URLs.'),
+              redirect: z.enum(['www', 'non-www', 'both']).optional(),
+            }),
+          )
+          .optional()
+          .describe('dockercompose only: per-service domains, used instead of fqdn/domains.'),
         // Delete fields
         delete_volumes: z.boolean().optional(),
         // Preview fields
@@ -2009,6 +2026,22 @@ export class CoolifyMcpServer extends McpServer {
       },
       async (args, extra) => {
         const { action, uuid, delete_volumes } = args;
+        // Coolify refuses `domains` for dockercompose with a 422 ("Use
+        // docker_compose_domains instead"); say so before any API call.
+        if (
+          (action === 'create_public' || action === 'create_github' || action === 'create_key') &&
+          args.build_pack === 'dockercompose' &&
+          (args.fqdn !== undefined || args.domains !== undefined)
+        ) {
+          return {
+            content: [
+              {
+                type: 'text' as const,
+                text: 'Error: build_pack dockercompose takes docker_compose_domains, not fqdn or domains',
+              },
+            ],
+          };
+        }
         switch (action) {
           case 'create_public':
             if (
@@ -2043,6 +2076,10 @@ export class CoolifyMcpServer extends McpServer {
                 description: args.description,
                 fqdn: args.fqdn,
                 domains: args.domains,
+                docker_compose_location: args.docker_compose_location,
+                docker_compose_custom_start_command: args.docker_compose_custom_start_command,
+                docker_compose_custom_build_command: args.docker_compose_custom_build_command,
+                docker_compose_domains: args.docker_compose_domains,
                 base_directory: args.base_directory,
                 publish_directory: args.publish_directory,
                 install_command: args.install_command,
@@ -2100,6 +2137,10 @@ export class CoolifyMcpServer extends McpServer {
                 description: args.description,
                 fqdn: args.fqdn,
                 domains: args.domains,
+                docker_compose_location: args.docker_compose_location,
+                docker_compose_custom_start_command: args.docker_compose_custom_start_command,
+                docker_compose_custom_build_command: args.docker_compose_custom_build_command,
+                docker_compose_domains: args.docker_compose_domains,
                 base_directory: args.base_directory,
                 publish_directory: args.publish_directory,
                 install_command: args.install_command,
@@ -2157,6 +2198,10 @@ export class CoolifyMcpServer extends McpServer {
                 description: args.description,
                 fqdn: args.fqdn,
                 domains: args.domains,
+                docker_compose_location: args.docker_compose_location,
+                docker_compose_custom_start_command: args.docker_compose_custom_start_command,
+                docker_compose_custom_build_command: args.docker_compose_custom_build_command,
+                docker_compose_domains: args.docker_compose_domains,
                 base_directory: args.base_directory,
                 publish_directory: args.publish_directory,
                 install_command: args.install_command,
