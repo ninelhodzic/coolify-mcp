@@ -2222,6 +2222,50 @@ describe('CoolifyClient', () => {
       expect(callBody.health_check_start_period).toBe(60);
     });
 
+    it('should send docker_compose_domains through createApplicationPrivateGH as a JSON array of objects', async () => {
+      mockFetch.mockResolvedValueOnce(mockResponse({ uuid: 'new-app-uuid' }));
+      const dockerComposeDomains = [
+        { name: 'web', domain: 'https://app.example.com', redirect: 'both' as const },
+        { name: 'api', domain: 'https://api.example.com' },
+      ];
+
+      await client.createApplicationPrivateGH({
+        project_uuid: 'proj-uuid',
+        server_uuid: 'server-uuid',
+        github_app_uuid: 'gh-app-uuid',
+        git_repository: 'org/monorepo',
+        git_branch: 'main',
+        build_pack: 'dockercompose',
+        docker_compose_location: '/docker-compose.staging.yml',
+        docker_compose_domains: dockerComposeDomains,
+      });
+
+      expect(mockFetch).toHaveBeenCalledWith(
+        'http://localhost:3000/api/v1/applications/private-github-app',
+        expect.objectContaining({ method: 'POST' }),
+      );
+      const rawBody = mockFetch.mock.calls[0][1]?.body as string;
+      const callBody = JSON.parse(rawBody);
+      expect(callBody.docker_compose_location).toBe('/docker-compose.staging.yml');
+      expect(Array.isArray(callBody.docker_compose_domains)).toBe(true);
+      expect(callBody.docker_compose_domains).toEqual(dockerComposeDomains);
+      expect(rawBody).toContain(`"docker_compose_domains":${JSON.stringify(dockerComposeDomains)}`);
+    });
+
+    it('should pass docker_compose_domains through updateApplication', async () => {
+      mockFetch.mockResolvedValueOnce(mockResponse(mockApplication));
+      const dockerComposeDomains = [{ name: 'web', domain: 'https://app.example.com' }];
+
+      await client.updateApplication('app-uuid', {
+        docker_compose_domains: dockerComposeDomains,
+        docker_compose_custom_start_command: 'docker compose up -d web',
+      });
+
+      const callBody = JSON.parse(mockFetch.mock.calls[0][1]?.body as string);
+      expect(callBody.docker_compose_domains).toEqual(dockerComposeDomains);
+      expect(callBody.docker_compose_custom_start_command).toBe('docker compose up -d web');
+    });
+
     it('should pass dockerfile_target_build through updateApplication (PATCH-only field)', async () => {
       mockFetch.mockResolvedValueOnce(mockResponse(mockApplication));
 

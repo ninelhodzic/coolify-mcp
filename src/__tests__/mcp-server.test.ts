@@ -1080,6 +1080,199 @@ describe('CoolifyMcpServer v2', () => {
         expect.objectContaining({ custom_network_aliases: 'media-asr' }),
       );
     });
+
+    describe('docker compose fields', () => {
+      // A git-sourced dockercompose app needs its compose path and per-service
+      // domains on create; previously zod stripped them and the create_*
+      // hand-picks never forwarded them. These go through the tool's
+      // inputSchema first, as a real MCP call does, so a field the schema
+      // strips fails here too.
+
+      const applicationSchema = (
+        srv: CoolifyMcpServer,
+      ): {
+        safeParse: (args: unknown) => {
+          success: boolean;
+          data?: Record<string, unknown>;
+          error?: unknown;
+        };
+      } =>
+        (
+          srv as unknown as {
+            _registeredTools: Record<
+              string,
+              {
+                inputSchema: {
+                  safeParse: (args: unknown) => {
+                    success: boolean;
+                    data?: Record<string, unknown>;
+                    error?: unknown;
+                  };
+                };
+              }
+            >;
+          }
+        )._registeredTools['application'].inputSchema;
+
+      const callParsed = async (
+        srv: CoolifyMcpServer,
+        args: Record<string, unknown>,
+      ): Promise<unknown> => {
+        const parsed = applicationSchema(srv).safeParse(args);
+        expect(parsed.success).toBe(true);
+        return callApplication(srv, parsed.data!);
+      };
+
+      const composeDomains = [
+        { name: 'web', domain: 'https://app.example.com', redirect: 'non-www' },
+        { name: 'api', domain: 'https://api.example.com,https://api2.example.com' },
+      ];
+
+      const composeFields = {
+        build_pack: 'dockercompose',
+        docker_compose_location: '/docker-compose.staging.yml',
+        docker_compose_custom_start_command: 'docker compose up -d web api',
+        docker_compose_custom_build_command: 'docker compose build web api',
+        docker_compose_domains: composeDomains,
+      };
+
+      it('forwards the compose fields in create_github', async () => {
+        const spy = jest
+          .spyOn(server['client'], 'createApplicationPrivateGH')
+          .mockResolvedValue({ uuid: 'app-6' });
+
+        await callParsed(server, {
+          action: 'create_github',
+          project_uuid: 'proj-uuid',
+          server_uuid: 'server-uuid',
+          github_app_uuid: 'gh-app-uuid',
+          git_repository: 'org/monorepo',
+          git_branch: 'main',
+          ...composeFields,
+        });
+
+        expect(spy).toHaveBeenCalledWith(
+          expect.objectContaining({
+            build_pack: 'dockercompose',
+            docker_compose_location: '/docker-compose.staging.yml',
+            docker_compose_custom_start_command: 'docker compose up -d web api',
+            docker_compose_custom_build_command: 'docker compose build web api',
+            docker_compose_domains: composeDomains,
+          }),
+        );
+      });
+
+      it('forwards the compose fields in create_public', async () => {
+        const spy = jest
+          .spyOn(server['client'], 'createApplicationPublic')
+          .mockResolvedValue({ uuid: 'app-7' });
+
+        await callParsed(server, {
+          ...baseCreatePublic,
+          ...composeFields,
+          ports_exposes: '80',
+        });
+
+        expect(spy).toHaveBeenCalledWith(
+          expect.objectContaining({
+            build_pack: 'dockercompose',
+            docker_compose_location: '/docker-compose.staging.yml',
+            docker_compose_custom_start_command: 'docker compose up -d web api',
+            docker_compose_custom_build_command: 'docker compose build web api',
+            docker_compose_domains: composeDomains,
+          }),
+        );
+      });
+
+      it('forwards the compose fields in create_key', async () => {
+        const spy = jest
+          .spyOn(server['client'], 'createApplicationPrivateKey')
+          .mockResolvedValue({ uuid: 'app-8' });
+
+        await callParsed(server, {
+          action: 'create_key',
+          project_uuid: 'proj-uuid',
+          server_uuid: 'server-uuid',
+          private_key_uuid: 'key-uuid',
+          git_repository: 'git@github.com:org/monorepo.git',
+          git_branch: 'main',
+          ...composeFields,
+        });
+
+        expect(spy).toHaveBeenCalledWith(
+          expect.objectContaining({
+            build_pack: 'dockercompose',
+            docker_compose_location: '/docker-compose.staging.yml',
+            docker_compose_custom_start_command: 'docker compose up -d web api',
+            docker_compose_custom_build_command: 'docker compose build web api',
+            docker_compose_domains: composeDomains,
+          }),
+        );
+      });
+
+      it('forwards docker_compose_domains through update', async () => {
+        const spy = jest
+          .spyOn(server['client'], 'updateApplication')
+          .mockResolvedValue({} as never);
+
+        await callParsed(server, {
+          action: 'update',
+          uuid: 'app-uuid',
+          docker_compose_location: '/docker-compose.staging.yml',
+          docker_compose_domains: composeDomains,
+        });
+
+        expect(spy).toHaveBeenCalledWith(
+          'app-uuid',
+          expect.objectContaining({
+            docker_compose_location: '/docker-compose.staging.yml',
+            docker_compose_domains: composeDomains,
+          }),
+        );
+      });
+
+      it('refuses a compose domain item with an unknown key', () => {
+        const result = applicationSchema(server).safeParse({
+          action: 'update',
+          uuid: 'app-uuid',
+          docker_compose_domains: [{ name: 'web', domain: 'https://app.example.com', port: 3000 }],
+        });
+
+        expect(result.success).toBe(false);
+      });
+
+      it('refuses a compose domain redirect outside www, non-www, both', () => {
+        const result = applicationSchema(server).safeParse({
+          action: 'update',
+          uuid: 'app-uuid',
+          docker_compose_domains: [
+            { name: 'web', domain: 'https://app.example.com', redirect: 'apex' },
+          ],
+        });
+
+        expect(result.success).toBe(false);
+      });
+
+      it('refuses fqdn or domains on a dockercompose create, naming docker_compose_domains', async () => {
+        const spy = jest
+          .spyOn(server['client'], 'createApplicationPrivateGH')
+          .mockResolvedValue({ uuid: 'app-9' });
+
+        const result = (await callParsed(server, {
+          action: 'create_github',
+          project_uuid: 'proj-uuid',
+          server_uuid: 'server-uuid',
+          github_app_uuid: 'gh-app-uuid',
+          git_repository: 'org/monorepo',
+          git_branch: 'main',
+          build_pack: 'dockercompose',
+          domains: 'https://app.example.com',
+        })) as { content: Array<{ text: string }> };
+
+        expect(result.content[0].text).toContain('docker_compose_domains');
+        expect(spy).not.toHaveBeenCalled();
+      });
+    });
   });
 
   describe('database tool handler', () => {
