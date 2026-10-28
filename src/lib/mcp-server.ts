@@ -2002,23 +2002,21 @@ export class CoolifyMcpServer extends McpServer {
         // Update-only: Coolify strips dockerfile_target_build on every create endpoint
         // (controller $allowedFields line 1014) but accepts on PATCH (line 2497).
         dockerfile_target_build: z.string().optional(),
-        // Docker Compose fields (create_public/github/key + update)
-        docker_compose_location: z
-          .string()
-          .optional()
-          .describe('dockercompose only: compose file path in the repo.'),
-        docker_compose_custom_start_command: z.string().optional().describe('dockercompose only.'),
-        docker_compose_custom_build_command: z.string().optional().describe('dockercompose only.'),
+        // Docker Compose fields (create_public/github/key + update). Descriptions
+        // stay this short because the evals tool-list token budget is tight.
+        docker_compose_location: z.string().optional().describe('dockercompose only.'),
+        docker_compose_custom_start_command: z.string().optional(),
+        docker_compose_custom_build_command: z.string().optional(),
         docker_compose_domains: z
           .array(
             z.strictObject({
-              name: z.string().describe('Compose service name.'),
-              domain: z.string().describe('Comma-separated URLs.'),
+              name: z.string(),
+              domain: z.string(),
               redirect: z.enum(['www', 'non-www', 'both']).optional(),
             }),
           )
           .optional()
-          .describe('dockercompose only: per-service domains, used instead of fqdn/domains.'),
+          .describe('dockercompose only; name = compose service.'),
         // Delete fields
         delete_volumes: z.boolean().optional(),
         // Preview fields

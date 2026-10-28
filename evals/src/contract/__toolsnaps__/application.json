@@ -153,6 +153,44 @@
       "dockerfile_target_build": {
         "type": "string"
       },
+      "docker_compose_location": {
+        "description": "dockercompose only.",
+        "type": "string"
+      },
+      "docker_compose_custom_start_command": {
+        "type": "string"
+      },
+      "docker_compose_custom_build_command": {
+        "type": "string"
+      },
+      "docker_compose_domains": {
+        "description": "dockercompose only; name = compose service.",
+        "type": "array",
+        "items": {
+          "type": "object",
+          "properties": {
+            "name": {
+              "type": "string"
+            },
+            "domain": {
+              "type": "string"
+            },
+            "redirect": {
+              "type": "string",
+              "enum": [
+                "www",
+                "non-www",
+                "both"
+              ]
+            }
+          },
+          "required": [
+            "name",
+            "domain"
+          ],
+          "additionalProperties": false
+        }
+      },
       "delete_volumes": {
         "type": "boolean"
       },
