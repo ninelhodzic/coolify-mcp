@@ -38,7 +38,7 @@
         "type": "string"
       },
       "destination_uuid": {
-        "description": "Required if the server has multiple destinations; find it with `list_destinations`.",
+        "description": "Needed when the server has several; see `list_destinations`.",
         "type": "string"
       },
       "git_repository": {
@@ -87,10 +87,13 @@
         "type": "string"
       },
       "custom_network_aliases": {
-        "description": "Comma-separated DNS aliases for app-to-app traffic (update only). App containers have no stable uuid hostname — only databases do.",
+        "description": "Comma-separated DNS aliases for app-to-app traffic (update only); apps have no stable uuid hostname.",
         "type": "string"
       },
       "instant_deploy": {
+        "type": "boolean"
+      },
+      "is_auto_deploy_enabled": {
         "type": "boolean"
       },
       "health_check_enabled": {
@@ -164,7 +167,7 @@
         "type": "string"
       },
       "docker_compose_domains": {
-        "description": "dockercompose only; name = compose service.",
+        "description": "dockercompose only; name = compose service; update needs docker_compose_raw loaded, else 422.",
         "type": "array",
         "items": {
           "type": "object",
