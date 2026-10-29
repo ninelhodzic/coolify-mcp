@@ -1949,9 +1949,7 @@ export class CoolifyMcpServer extends McpServer {
         destination_uuid: z
           .string()
           .optional()
-          .describe(
-            'Required if the server has multiple destinations; find it with `list_destinations`.',
-          ),
+          .describe('Needed when the server has several; see `list_destinations`.'),
         git_repository: z.string().optional(),
         git_branch: z.string().optional(),
         environment_name: z.string().optional(),
@@ -1974,9 +1972,12 @@ export class CoolifyMcpServer extends McpServer {
           .string()
           .optional()
           .describe(
-            'Comma-separated DNS aliases for app-to-app traffic (update only). App containers have no stable uuid hostname — only databases do.',
+            'Comma-separated DNS aliases for app-to-app traffic (update only); apps have no stable uuid hostname.',
           ),
         instant_deploy: z.boolean().optional(),
+        // Coolify defaults it to true: a push to git_branch deploys via the
+        // webhook. create_public/github/key + update; absent = not sent.
+        is_auto_deploy_enabled: z.boolean().optional(),
         // Health check fields
         health_check_enabled: z.boolean().optional(),
         health_check_path: z.string().optional(),
@@ -2016,7 +2017,9 @@ export class CoolifyMcpServer extends McpServer {
             }),
           )
           .optional()
-          .describe('dockercompose only; name = compose service.'),
+          .describe(
+            'dockercompose only; name = compose service; update needs docker_compose_raw loaded, else 422.',
+          ),
         // Delete fields
         delete_volumes: z.boolean().optional(),
         // Preview fields
@@ -2100,6 +2103,7 @@ export class CoolifyMcpServer extends McpServer {
                 custom_docker_run_options: args.custom_docker_run_options,
                 custom_labels: args.custom_labels,
                 instant_deploy: args.instant_deploy,
+                is_auto_deploy_enabled: args.is_auto_deploy_enabled,
               }),
             );
           case 'create_github':
@@ -2161,6 +2165,7 @@ export class CoolifyMcpServer extends McpServer {
                 custom_docker_run_options: args.custom_docker_run_options,
                 custom_labels: args.custom_labels,
                 instant_deploy: args.instant_deploy,
+                is_auto_deploy_enabled: args.is_auto_deploy_enabled,
               }),
             );
           case 'create_key':
@@ -2222,6 +2227,7 @@ export class CoolifyMcpServer extends McpServer {
                 custom_docker_run_options: args.custom_docker_run_options,
                 custom_labels: args.custom_labels,
                 instant_deploy: args.instant_deploy,
+                is_auto_deploy_enabled: args.is_auto_deploy_enabled,
               }),
             );
           case 'create_dockerimage':

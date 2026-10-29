@@ -14,6 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`application` forwards `is_auto_deploy_enabled`.** `create_public`, `create_github`, `create_key` and `update` accept an optional boolean and send it unchanged (nothing is sent when it is absent), so an app can be created without Coolify's default deploy-on-push; the `docker_compose_domains` description now notes that `update` needs a loaded `docker_compose_raw`, else Coolify returns 422.
 - **`application` forwards Docker Compose fields.** `create_public`, `create_github`, `create_key` and `update` now accept and forward `docker_compose_location`, `docker_compose_custom_start_command`, `docker_compose_custom_build_command` and `docker_compose_domains` (an array of `{ name, domain, redirect? }`, `redirect` in `www | non-www | both`, sent as JSON); a `dockercompose` create that passes `fqdn` or `domains` is refused before any API call, naming `docker_compose_domains`.
 - **`deploy` with `wait: true` no longer echoes an unobservable trigger as if it succeeded.** When Coolify returns no `deployment_uuid` (the normal case for a service start), the response is now `status: "not_observable"` with the resource uuids, bounded trigger messages, a reason and a next action to verify the resource through its matching `get_*` tool, plus `_actions` classified per entry from Coolify's message (`Service …` → `get_service`, `Database …` → `get_database`, anything else → none) — instead of Coolify's raw "queued" message. `wait: false` is unchanged.
 

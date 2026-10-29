@@ -444,6 +444,8 @@ export interface CreateApplicationPublicRequest {
   custom_docker_run_options?: string;
   custom_labels?: string;
   instant_deploy?: boolean;
+  // Deploy on every push to git_branch via the git webhook; Coolify defaults to true.
+  is_auto_deploy_enabled?: boolean;
 }
 
 export interface CreateApplicationPrivateGHRequest extends Omit<
@@ -579,6 +581,8 @@ export interface UpdateApplicationRequest {
   health_check_timeout?: number;
   health_check_retries?: number;
   health_check_start_period?: number;
+  // Deploy on every push to git_branch via the git webhook
+  is_auto_deploy_enabled?: boolean;
   // Resource limits
   limits_memory?: string;
   limits_memory_swap?: string;
