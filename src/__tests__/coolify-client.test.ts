@@ -2266,6 +2266,37 @@ describe('CoolifyClient', () => {
       expect(callBody.docker_compose_custom_start_command).toBe('docker compose up -d web');
     });
 
+    it('should send is_auto_deploy_enabled through createApplicationPrivateGH and omit it when undefined', async () => {
+      const base = {
+        project_uuid: 'proj-uuid',
+        server_uuid: 'server-uuid',
+        github_app_uuid: 'gh-app-uuid',
+        git_repository: 'org/monorepo',
+        git_branch: 'main',
+      };
+      mockFetch.mockResolvedValueOnce(mockResponse({ uuid: 'new-app-uuid' }));
+      mockFetch.mockResolvedValueOnce(mockResponse({ uuid: 'new-app-uuid' }));
+
+      await client.createApplicationPrivateGH({ ...base, is_auto_deploy_enabled: false });
+      await client.createApplicationPrivateGH({ ...base, is_auto_deploy_enabled: undefined });
+
+      expect(JSON.parse(mockFetch.mock.calls[0][1]?.body as string).is_auto_deploy_enabled).toBe(
+        false,
+      );
+      expect(JSON.parse(mockFetch.mock.calls[1][1]?.body as string)).not.toHaveProperty(
+        'is_auto_deploy_enabled',
+      );
+    });
+
+    it('should pass is_auto_deploy_enabled through updateApplication', async () => {
+      mockFetch.mockResolvedValueOnce(mockResponse(mockApplication));
+
+      await client.updateApplication('app-uuid', { is_auto_deploy_enabled: false });
+
+      const callBody = JSON.parse(mockFetch.mock.calls[0][1]?.body as string);
+      expect(callBody).toEqual({ is_auto_deploy_enabled: false });
+    });
+
     it('should pass dockerfile_target_build through updateApplication (PATCH-only field)', async () => {
       mockFetch.mockResolvedValueOnce(mockResponse(mockApplication));
 

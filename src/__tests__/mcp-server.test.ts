@@ -1273,6 +1273,119 @@ describe('CoolifyMcpServer v2', () => {
         expect(spy).not.toHaveBeenCalled();
       });
     });
+
+    describe('auto deploy setting', () => {
+      // Coolify defaults is_auto_deploy_enabled to true, so a push to the
+      // tracked branch deploys through the GitHub app webhook. The tool must
+      // forward the setting unchanged and send nothing when it is absent.
+      // Mock the raw HTTP layer so these assert the payload that leaves.
+      const mockFetch = jest.fn<typeof fetch>();
+      let originalFetch: typeof fetch;
+
+      beforeEach(() => {
+        originalFetch = global.fetch;
+        global.fetch = mockFetch;
+        mockFetch.mockResolvedValue({
+          ok: true,
+          status: 200,
+          statusText: 'OK',
+          headers: new Headers({ 'Content-Type': 'application/json' }),
+          text: async () => JSON.stringify({ uuid: 'app-uuid' }),
+        } as Response);
+      });
+
+      afterEach(() => {
+        global.fetch = originalFetch;
+        mockFetch.mockReset();
+      });
+
+      const parse = (args: Record<string, unknown>) =>
+        (
+          server as unknown as {
+            _registeredTools: Record<
+              string,
+              {
+                inputSchema: {
+                  safeParse: (args: unknown) => {
+                    success: boolean;
+                    data?: Record<string, unknown>;
+                  };
+                };
+              }
+            >;
+          }
+        )._registeredTools['application'].inputSchema.safeParse(args);
+
+      const sentBody = async (args: Record<string, unknown>): Promise<Record<string, unknown>> => {
+        const parsed = parse(args);
+        expect(parsed.success).toBe(true);
+        await callApplication(server, parsed.data!);
+        expect(mockFetch).toHaveBeenCalledTimes(1);
+        return JSON.parse(mockFetch.mock.calls[0][1]?.body as string);
+      };
+
+      const baseCreateGithub = {
+        action: 'create_github',
+        project_uuid: 'proj-uuid',
+        server_uuid: 'server-uuid',
+        github_app_uuid: 'gh-app-uuid',
+        git_repository: 'org/monorepo',
+        git_branch: 'main',
+        build_pack: 'dockercompose',
+      };
+
+      it('forwards is_auto_deploy_enabled: false in create_github', async () => {
+        const body = await sentBody({ ...baseCreateGithub, is_auto_deploy_enabled: false });
+        expect(body.is_auto_deploy_enabled).toBe(false);
+      });
+
+      it('forwards is_auto_deploy_enabled: true in create_public', async () => {
+        const body = await sentBody({ ...baseCreatePublic, is_auto_deploy_enabled: true });
+        expect(body.is_auto_deploy_enabled).toBe(true);
+      });
+
+      it('forwards is_auto_deploy_enabled: false in create_key', async () => {
+        const body = await sentBody({
+          action: 'create_key',
+          project_uuid: 'proj-uuid',
+          server_uuid: 'server-uuid',
+          private_key_uuid: 'key-uuid',
+          git_repository: 'git@github.com:org/monorepo.git',
+          git_branch: 'main',
+          is_auto_deploy_enabled: false,
+        });
+        expect(body.is_auto_deploy_enabled).toBe(false);
+      });
+
+      it('forwards is_auto_deploy_enabled: false through update', async () => {
+        const body = await sentBody({
+          action: 'update',
+          uuid: 'app-uuid',
+          is_auto_deploy_enabled: false,
+        });
+        expect(body).toEqual({ is_auto_deploy_enabled: false });
+        expect(mockFetch.mock.calls[0][1]?.method).toBe('PATCH');
+      });
+
+      it('sends no is_auto_deploy_enabled key when it is absent', async () => {
+        const create = await sentBody(baseCreateGithub);
+        expect(create).not.toHaveProperty('is_auto_deploy_enabled');
+        mockFetch.mockClear();
+        const update = await sentBody({ action: 'update', uuid: 'app-uuid', name: 'web' });
+        expect(update).toEqual({ name: 'web' });
+      });
+
+      it('refuses a non-boolean is_auto_deploy_enabled', () => {
+        for (const value of ['false', 0, null]) {
+          const result = parse({
+            action: 'update',
+            uuid: 'app-uuid',
+            is_auto_deploy_enabled: value,
+          });
+          expect(result.success).toBe(false);
+        }
+      });
+    });
   });
 
   describe('database tool handler', () => {
