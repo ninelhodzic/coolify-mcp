@@ -1385,6 +1385,40 @@ describe('CoolifyMcpServer v2', () => {
           expect(result.success).toBe(false);
         }
       });
+
+      describe('commit pin', () => {
+        // A pinned application keeps git_commit_sha across a branch change,
+        // so update must forward the pin unchanged. Create does not send it.
+        const sha = 'ffe8951ae16effb1e45716bee45dc4724c7527d9';
+
+        it('forwards git_commit_sha through update', async () => {
+          const body = await sentBody({
+            action: 'update',
+            uuid: 'app-uuid',
+            git_branch: 'main',
+            git_commit_sha: sha,
+          });
+          expect(body).toEqual({ git_branch: 'main', git_commit_sha: sha });
+          expect(mockFetch.mock.calls[0][1]?.method).toBe('PATCH');
+        });
+
+        it('sends no git_commit_sha key on update when it is absent', async () => {
+          const body = await sentBody({ action: 'update', uuid: 'app-uuid', git_branch: 'main' });
+          expect(body).toEqual({ git_branch: 'main' });
+        });
+
+        it('sends no git_commit_sha key on create_github', async () => {
+          const body = await sentBody({ ...baseCreateGithub, git_commit_sha: sha });
+          expect(body).not.toHaveProperty('git_commit_sha');
+        });
+
+        it('refuses a non-string git_commit_sha', () => {
+          for (const value of [123, null, true]) {
+            const result = parse({ action: 'update', uuid: 'app-uuid', git_commit_sha: value });
+            expect(result.success).toBe(false);
+          }
+        });
+      });
     });
   });
 
