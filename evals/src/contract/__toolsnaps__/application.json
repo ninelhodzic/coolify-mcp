@@ -47,6 +47,10 @@
       "git_branch": {
         "type": "string"
       },
+      "git_commit_sha": {
+        "description": "update only; pinned commit, \"HEAD\" = branch tip",
+        "type": "string"
+      },
       "environment_name": {
         "type": "string"
       },
