@@ -1952,6 +1952,10 @@ export class CoolifyMcpServer extends McpServer {
           .describe('Needed when the server has several; see `list_destinations`.'),
         git_repository: z.string().optional(),
         git_branch: z.string().optional(),
+        git_commit_sha: z
+          .string()
+          .optional()
+          .describe('update only; pinned commit, "HEAD" = branch tip'),
         environment_name: z.string().optional(),
         environment_uuid: z.string().optional(),
         build_pack: z.string().optional(),
